@@ -732,6 +732,538 @@ class AgentBay:
             return {}
         return resp.json()
 
+    # ------------------------------------------------------------------
+    # Teams & Projects wrappers
+    # ------------------------------------------------------------------
+
+    def team(self, team_id: str) -> "TeamContext":
+        """Create a team context. While active, chat() auto-shares with teammates.
+
+        Args:
+            team_id: The team ID to scope operations to.
+
+        Returns:
+            A :class:`TeamContext` that provides team-aware chat and recall.
+        """
+        return TeamContext(self, team_id)
+
+    def project(self, project_id: str | None = None) -> "ProjectContext":
+        """Create a project context. chat() auto-recalls from project memory,
+        auto-stores to project, auto-onboards on first call.
+
+        Args:
+            project_id: Project to use (falls back to the brain's default).
+
+        Returns:
+            A :class:`ProjectContext` that provides project-aware chat and memory.
+        """
+        pid = project_id or self.project_id
+        if not pid:
+            raise AgentBayError(
+                "No project_id provided. Either pass project_id, "
+                "set it in the constructor, or call setup_brain() first."
+            )
+        return ProjectContext(self, pid)
+
+    def create_team(self, name: str, agent_ids: list[str] | None = None) -> dict:
+        """Create a team and optionally add agents.
+
+        Args:
+            name: Human-readable team name.
+            agent_ids: Optional list of agent IDs to add as members.
+
+        Returns:
+            Dict with team details including ``teamId``.
+        """
+        body: Dict[str, Any] = {"name": name}
+        if agent_ids:
+            body["agentIds"] = agent_ids
+        return self._post("/api/v1/teams", body)
+
+    def create_project(self, name: str, description: str | None = None) -> dict:
+        """Create a project.
+
+        Args:
+            name: Human-readable project name.
+            description: Optional project description.
+
+        Returns:
+            Dict with project details including ``id``.
+        """
+        body: Dict[str, Any] = {"name": name}
+        if description is not None:
+            body["description"] = description
+        return self._post("/api/v1/projects", body)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def __repr__(self) -> str:
         masked = f"{self.api_key[:8]}...{self.api_key[-4:]}" if len(self.api_key) > 12 else "***"
         return f"AgentBay(api_key='{masked}', project_id={self.project_id!r})"
+
+
+# ======================================================================
+# TeamContext
+# ======================================================================
+
+
+class TeamContext:
+    """Context manager for team-aware memory.
+
+    When using a ``TeamContext``, recall searches across all teammates'
+    brains, and stored memories are tagged with ``scope='team'`` so they
+    are visible to the entire team.
+
+    Usage::
+
+        brain = AgentBay("key", project_id="proj123")
+        team = brain.team("team456")
+
+        # chat() recalls from your brain + all teammates' brains
+        response = team.chat([{"role": "user", "content": "fix the auth bug"}])
+
+        # Memories auto-stored to your brain AND visible to team
+    """
+
+    def __init__(self, brain: AgentBay, team_id: str) -> None:
+        self.brain = brain
+        self.team_id = team_id
+
+    def chat(
+        self,
+        messages: list[dict],
+        model: str = "claude-sonnet-4-20250514",
+        provider: str = "anthropic",
+        project_id: str | None = None,
+        auto_recall: bool = True,
+        auto_store: bool = True,
+        recall_limit: int = 3,
+        **kwargs: Any,
+    ) -> Any:
+        """Like brain.chat() but recalls from team members too.
+
+        Memory recall searches across all teammates' brains via
+        ``scope='team'``. Stored learnings are tagged with ``scope='team'``
+        so teammates can see them.
+
+        Args:
+            messages: Chat messages in OpenAI format.
+            model: Model name. Defaults to ``claude-sonnet-4-20250514``.
+            provider: ``"anthropic"`` or ``"openai"``.
+            project_id: Project for memory ops (overrides default).
+            auto_recall: Whether to recall relevant memories. Defaults to True.
+            auto_store: Whether to store learnings. Defaults to True.
+            recall_limit: Max memories to recall (1-10). Defaults to 3.
+            **kwargs: Extra keyword arguments passed to the LLM client.
+
+        Returns:
+            The raw LLM response object.
+        """
+        pid = self.brain._resolve_project(project_id)
+        enriched_messages = list(messages)
+        memory_context = ""
+
+        # --- 1. Auto-recall from team scope ---
+        if auto_recall:
+            last_user_msg = AgentBay._extract_last_user_message(messages)
+            if last_user_msg:
+                try:
+                    memories = self.recall(last_user_msg, project_id=pid, limit=recall_limit)
+                    if memories:
+                        memory_context = AgentBay._format_memory_context(memories)
+                        enriched_messages = AgentBay._inject_memory_context(
+                            enriched_messages, memory_context, provider
+                        )
+                except Exception:
+                    pass
+
+        # --- 2. Call the LLM ---
+        response = AgentBay._call_llm(enriched_messages, model, provider, **kwargs)
+
+        # --- 3. Auto-store with team scope ---
+        if auto_store:
+            last_user_msg = AgentBay._extract_last_user_message(messages)
+            assistant_text = AgentBay._extract_response_text(response, provider)
+            if last_user_msg and assistant_text:
+                thread = threading.Thread(
+                    target=self._auto_store_team_learnings,
+                    args=(last_user_msg, assistant_text, pid),
+                    daemon=True,
+                )
+                thread.start()
+
+        return response
+
+    def recall(
+        self,
+        query: str,
+        project_id: str | None = None,
+        limit: int = 5,
+        tier: str | None = None,
+        tags: list[str] | None = None,
+    ) -> List[MemoryEntry]:
+        """Recall from own brain + all teammates' brains.
+
+        Args:
+            query: Natural-language search query.
+            project_id: Project to search in (overrides default).
+            limit: Max results. Defaults to 5.
+            tier: Filter by storage tier.
+            tags: Filter by tags.
+
+        Returns:
+            Deduplicated list of matching entries from the team.
+        """
+        pid = self.brain._resolve_project(project_id)
+        body: Dict[str, Any] = {
+            "query": query,
+            "limit": limit,
+            "scope": "team",
+            "teamId": self.team_id,
+        }
+        if tier is not None:
+            body["tier"] = tier
+        if tags is not None:
+            body["tags"] = tags
+
+        resp = self.brain._post(f"/api/v1/projects/{pid}/memory/recall", body)
+        if isinstance(resp, list):
+            return resp
+        return resp.get("results", resp.get("entries", []))
+
+    def members(self) -> List[Dict[str, Any]]:
+        """List team members and their agents.
+
+        Returns:
+            List of dicts with member info (agent ID, name, role, etc.).
+        """
+        return self.brain._get(f"/api/v1/teams/{self.team_id}/members")
+
+    def _auto_store_team_learnings(self, user_msg: str, assistant_text: str, project_id: str) -> None:
+        """Extract and store learnings with team scope (runs in background)."""
+        try:
+            if not _LEARNING_PATTERNS.search(assistant_text):
+                return
+
+            paragraphs = assistant_text.split("\n\n")
+            best_paragraph = ""
+            for para in paragraphs:
+                if _LEARNING_PATTERNS.search(para):
+                    best_paragraph = para.strip()
+                    break
+
+            if not best_paragraph:
+                best_paragraph = assistant_text[:500]
+
+            entry_type = _detect_type(best_paragraph)
+            title = _extract_title(best_paragraph)
+            content = f"Q: {user_msg[:200]}\nA: {best_paragraph[:800]}"
+
+            body: Dict[str, Any] = {
+                "content": content,
+                "type": entry_type,
+                "tier": "semantic",
+                "title": title,
+                "tags": ["auto-learned", "chat", "team"],
+                "scope": "team",
+                "teamId": self.team_id,
+            }
+            self.brain._post(f"/api/v1/projects/{project_id}/memory/store", body)
+        except Exception:
+            pass
+
+    def __repr__(self) -> str:
+        return f"TeamContext(team_id={self.team_id!r}, brain={self.brain!r})"
+
+
+# ======================================================================
+# ProjectContext
+# ======================================================================
+
+
+class ProjectContext:
+    """Context manager for project-aware memory.
+
+    When using a ``ProjectContext``, recall searches project memory
+    (shared across all project agents), and stored memories go into the
+    project's shared knowledge base. Auto-onboards on the first chat call.
+
+    Usage::
+
+        brain = AgentBay("key")
+        proj = brain.project("proj123")
+
+        # Auto-onboards on first call, recalls from project memory
+        response = proj.chat([{"role": "user", "content": "refactor the API"}])
+        # Learnings stored to project memory for all agents to see
+    """
+
+    def __init__(self, brain: AgentBay, project_id: str) -> None:
+        self.brain = brain
+        self.project_id = project_id
+        self._onboarded = False
+        self._onboard_brief: str | None = None
+
+    def chat(
+        self,
+        messages: list[dict],
+        model: str = "claude-sonnet-4-20250514",
+        provider: str = "anthropic",
+        auto_recall: bool = True,
+        auto_store: bool = True,
+        recall_limit: int = 3,
+        **kwargs: Any,
+    ) -> Any:
+        """Like brain.chat() but with project memory.
+
+        On the first call, automatically onboards (fetches project brief,
+        open tasks, knowledge, and latest handoff) and prepends the brief
+        to context. Subsequent calls just recall from project memory.
+
+        Args:
+            messages: Chat messages in OpenAI format.
+            model: Model name. Defaults to ``claude-sonnet-4-20250514``.
+            provider: ``"anthropic"`` or ``"openai"``.
+            auto_recall: Whether to recall relevant memories. Defaults to True.
+            auto_store: Whether to store learnings. Defaults to True.
+            recall_limit: Max memories to recall (1-10). Defaults to 3.
+            **kwargs: Extra keyword arguments passed to the LLM client.
+
+        Returns:
+            The raw LLM response object.
+        """
+        enriched_messages = list(messages)
+
+        # --- 1. Auto-onboard on first call ---
+        if not self._onboarded:
+            try:
+                onboard_data = self.onboard()
+                self._onboarded = True
+                brief_parts = []
+                if isinstance(onboard_data, dict):
+                    if onboard_data.get("brief"):
+                        brief_parts.append(f"Project brief: {onboard_data['brief']}")
+                    if onboard_data.get("handoff"):
+                        brief_parts.append(f"Latest handoff: {onboard_data['handoff']}")
+                    if onboard_data.get("tasks"):
+                        tasks_str = ", ".join(
+                            t.get("title", str(t)) for t in onboard_data["tasks"][:5]
+                        ) if isinstance(onboard_data["tasks"], list) else str(onboard_data["tasks"])
+                        brief_parts.append(f"Open tasks: {tasks_str}")
+                if brief_parts:
+                    self._onboard_brief = "\n".join(brief_parts)
+            except Exception:
+                self._onboarded = True  # Don't retry on failure
+
+        # --- 2. Recall from project memory ---
+        if auto_recall:
+            last_user_msg = AgentBay._extract_last_user_message(messages)
+            if last_user_msg:
+                try:
+                    memories = self.recall(last_user_msg, limit=recall_limit)
+                    context_parts = []
+                    if self._onboard_brief:
+                        context_parts.append(
+                            f"[Project onboarding context]\n{self._onboard_brief}"
+                        )
+                    if memories:
+                        context_parts.append(AgentBay._format_memory_context(memories))
+                    if context_parts:
+                        full_context = "\n\n".join(context_parts)
+                        enriched_messages = AgentBay._inject_memory_context(
+                            enriched_messages, full_context, provider
+                        )
+                except Exception:
+                    # Still inject onboard brief if recall failed
+                    if self._onboard_brief:
+                        enriched_messages = AgentBay._inject_memory_context(
+                            enriched_messages,
+                            f"[Project onboarding context]\n{self._onboard_brief}",
+                            provider,
+                        )
+        elif self._onboard_brief:
+            enriched_messages = AgentBay._inject_memory_context(
+                enriched_messages,
+                f"[Project onboarding context]\n{self._onboard_brief}",
+                provider,
+            )
+
+        # --- 3. Call the LLM ---
+        response = AgentBay._call_llm(enriched_messages, model, provider, **kwargs)
+
+        # --- 4. Auto-store to project memory ---
+        if auto_store:
+            last_user_msg = AgentBay._extract_last_user_message(messages)
+            assistant_text = AgentBay._extract_response_text(response, provider)
+            if last_user_msg and assistant_text:
+                thread = threading.Thread(
+                    target=self._auto_store_project_learnings,
+                    args=(last_user_msg, assistant_text),
+                    daemon=True,
+                )
+                thread.start()
+
+        return response
+
+    def recall(
+        self,
+        query: str,
+        limit: int = 5,
+        tier: str | None = None,
+        tags: list[str] | None = None,
+    ) -> List[MemoryEntry]:
+        """Recall from project memory.
+
+        Args:
+            query: Natural-language search query.
+            limit: Max results. Defaults to 5.
+            tier: Filter by storage tier.
+            tags: Filter by tags.
+
+        Returns:
+            List of matching entries from project memory.
+        """
+        body: Dict[str, Any] = {
+            "query": query,
+            "limit": limit,
+        }
+        if tier is not None:
+            body["tier"] = tier
+        if tags is not None:
+            body["tags"] = tags
+
+        resp = self.brain._post(f"/api/v1/projects/{self.project_id}/memory/recall", body)
+        if isinstance(resp, list):
+            return resp
+        return resp.get("results", resp.get("entries", []))
+
+    def store(
+        self,
+        content: str,
+        title: str | None = None,
+        type: str = "PATTERN",
+        tier: str = "semantic",
+        tags: list[str] | None = None,
+    ) -> MemoryEntry:
+        """Store to project memory (visible to all project agents).
+
+        Args:
+            content: The knowledge content to store.
+            title: Optional short title.
+            type: Entry type -- PATTERN, FACT, PREFERENCE, PROCEDURE, CONTEXT.
+            tier: Storage tier -- semantic, episodic, procedural.
+            tags: Optional tags for categorization.
+
+        Returns:
+            Dict with the created entry.
+        """
+        body: Dict[str, Any] = {
+            "content": content,
+            "type": type,
+            "tier": tier,
+        }
+        if title is not None:
+            body["title"] = title
+        if tags is not None:
+            body["tags"] = tags
+
+        return self.brain._post(f"/api/v1/projects/{self.project_id}/memory/store", body)
+
+    def ingest(self, files: list[dict]) -> Dict[str, Any]:
+        """Ingest files into project memory.
+
+        Args:
+            files: List of dicts with ``name`` and ``content`` keys.
+                Example: ``[{"name": "README.md", "content": "# My Project..."}]``
+
+        Returns:
+            Dict with ingestion results.
+        """
+        body: Dict[str, Any] = {"files": files}
+        return self.brain._post(f"/api/v1/projects/{self.project_id}/memory/ingest", body)
+
+    def handoff(
+        self,
+        summary: str,
+        completed_steps: list[str] | None = None,
+        blockers: list[str] | None = None,
+        next_steps: list[str] | None = None,
+    ) -> MemoryEntry:
+        """Hand off to the next agent with structured context.
+
+        Stores a CONTEXT entry with structured handoff data so the next
+        agent (or next session) can pick up where you left off.
+
+        Args:
+            summary: High-level summary of what was done.
+            completed_steps: List of completed work items.
+            blockers: List of known blockers or issues.
+            next_steps: List of recommended next actions.
+
+        Returns:
+            Dict with the created handoff entry.
+        """
+        handoff_data: Dict[str, Any] = {"summary": summary}
+        if completed_steps:
+            handoff_data["completedSteps"] = completed_steps
+        if blockers:
+            handoff_data["blockers"] = blockers
+        if next_steps:
+            handoff_data["nextSteps"] = next_steps
+
+        content_parts = [f"Handoff Summary: {summary}"]
+        if completed_steps:
+            content_parts.append("Completed: " + "; ".join(completed_steps))
+        if blockers:
+            content_parts.append("Blockers: " + "; ".join(blockers))
+        if next_steps:
+            content_parts.append("Next steps: " + "; ".join(next_steps))
+
+        return self.store(
+            content="\n".join(content_parts),
+            title=f"Handoff: {_extract_title(summary, max_len=80)}",
+            type="CONTEXT",
+            tags=["handoff"],
+        )
+
+    def onboard(self) -> Dict[str, Any]:
+        """Get project brief, open tasks, knowledge, and latest handoff.
+
+        Returns:
+            Dict with onboarding info (brief, tasks, knowledge, handoff).
+        """
+        return self.brain._post(f"/api/v1/projects/{self.project_id}/onboard", {})
+
+    def _auto_store_project_learnings(self, user_msg: str, assistant_text: str) -> None:
+        """Extract and store learnings to project memory (runs in background)."""
+        try:
+            if not _LEARNING_PATTERNS.search(assistant_text):
+                return
+
+            paragraphs = assistant_text.split("\n\n")
+            best_paragraph = ""
+            for para in paragraphs:
+                if _LEARNING_PATTERNS.search(para):
+                    best_paragraph = para.strip()
+                    break
+
+            if not best_paragraph:
+                best_paragraph = assistant_text[:500]
+
+            entry_type = _detect_type(best_paragraph)
+            title = _extract_title(best_paragraph)
+            content = f"Q: {user_msg[:200]}\nA: {best_paragraph[:800]}"
+
+            self.store(
+                content=content,
+                title=title,
+                type=entry_type,
+                tags=["auto-learned", "chat", "project"],
+            )
+        except Exception:
+            pass
+
+    def __repr__(self) -> str:
+        return f"ProjectContext(project_id={self.project_id!r}, brain={self.brain!r})"

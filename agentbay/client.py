@@ -287,7 +287,7 @@ class AgentBay:
         if metadata:
             body["metadata"] = metadata
 
-        return self._post(f"/api/v1/projects/{pid}/memory/store", body)
+        return self._post(f"/api/v1/projects/{pid}/memory", body)
 
     # ------------------------------------------------------------------
     # search() -- Mem0-compatible recall alias
@@ -361,7 +361,7 @@ class AgentBay:
         if tags is not None:
             body["tags"] = tags
 
-        return self._post(f"/api/v1/projects/{pid}/memory/store", body)
+        return self._post(f"/api/v1/projects/{pid}/memory", body)
 
     def recall(
         self,
@@ -393,8 +393,12 @@ class AgentBay:
         if tags is not None:
             body["tags"] = tags
 
-        resp = self._post(f"/api/v1/projects/{pid}/memory/recall", body)
-        # The API may return results under a "results" key or as a list directly.
+        params: Dict[str, Any] = {"q": query, "limit": str(limit)}
+        if tier is not None:
+            params["tier"] = tier
+        if tags is not None:
+            params["tags"] = ",".join(tags)
+        resp = self._get(f"/api/v1/projects/{pid}/memory", params)
         if isinstance(resp, list):
             return resp
         return resp.get("results", resp.get("entries", []))
@@ -411,7 +415,7 @@ class AgentBay:
             project_id: Project containing the entry (overrides default).
         """
         pid = self._resolve_project(project_id)
-        self._post(f"/api/v1/projects/{pid}/memory/forget", {"knowledgeId": knowledge_id})
+        self._delete(f"/api/v1/projects/{pid}/memory", {"knowledgeId": knowledge_id})
 
     def verify(
         self,
@@ -425,7 +429,7 @@ class AgentBay:
             project_id: Project containing the entry (overrides default).
         """
         pid = self._resolve_project(project_id)
-        self._post(f"/api/v1/projects/{pid}/memory/verify", {"knowledgeId": knowledge_id})
+        self._patch(f"/api/v1/projects/{pid}/memory", {"knowledgeId": knowledge_id, "action": "verify"})
 
     def health(
         self,
@@ -442,7 +446,7 @@ class AgentBay:
             Dict with health metrics.
         """
         pid = self._resolve_project(project_id)
-        return self._get(f"/api/v1/projects/{pid}/memory/health")
+        return self._get(f"/api/v1/projects/{pid}/memory", {"action": "health"})
 
     # ------------------------------------------------------------------
     # Brain management
@@ -702,6 +706,26 @@ class AgentBay:
             raise AgentBayError(f"Request timed out after {self.timeout}s") from exc
         return self._handle_response(resp)
 
+    def _patch(self, path: str, body: Dict[str, Any]) -> Any:
+        url = f"{self.base_url}{path}"
+        try:
+            resp = self._session.patch(url, json=body, timeout=self.timeout)
+        except requests.ConnectionError as exc:
+            raise AgentBayError(f"Connection failed: {exc}") from exc
+        except requests.Timeout as exc:
+            raise AgentBayError(f"Request timed out after {self.timeout}s") from exc
+        return self._handle_response(resp)
+
+    def _delete(self, path: str, body: Dict[str, Any] | None = None) -> Any:
+        url = f"{self.base_url}{path}"
+        try:
+            resp = self._session.delete(url, json=body, timeout=self.timeout)
+        except requests.ConnectionError as exc:
+            raise AgentBayError(f"Connection failed: {exc}") from exc
+        except requests.Timeout as exc:
+            raise AgentBayError(f"Request timed out after {self.timeout}s") from exc
+        return self._handle_response(resp)
+
     def _handle_response(self, resp: requests.Response) -> Any:
         if resp.status_code == 401:
             raise AuthenticationError(
@@ -928,7 +952,10 @@ class TeamContext:
         if tags is not None:
             body["tags"] = tags
 
-        resp = self.brain._post(f"/api/v1/projects/{pid}/memory/recall", body)
+        params: Dict[str, Any] = {"q": query, "limit": str(limit), "scope": "team"}
+        if tags is not None:
+            params["tags"] = ",".join(tags)
+        resp = self.brain._get(f"/api/v1/projects/{pid}/memory", params)
         if isinstance(resp, list):
             return resp
         return resp.get("results", resp.get("entries", []))
@@ -970,7 +997,7 @@ class TeamContext:
                 "scope": "team",
                 "teamId": self.team_id,
             }
-            self.brain._post(f"/api/v1/projects/{project_id}/memory/store", body)
+            self.brain._post(f"/api/v1/projects/{project_id}/memory", body)
         except Exception:
             pass
 
@@ -1134,7 +1161,10 @@ class ProjectContext:
         if tags is not None:
             body["tags"] = tags
 
-        resp = self.brain._post(f"/api/v1/projects/{self.project_id}/memory/recall", body)
+        params: Dict[str, Any] = {"q": query, "limit": str(limit)}
+        if tags is not None:
+            params["tags"] = ",".join(tags)
+        resp = self.brain._get(f"/api/v1/projects/{self.project_id}/memory", params)
         if isinstance(resp, list):
             return resp
         return resp.get("results", resp.get("entries", []))
@@ -1169,7 +1199,7 @@ class ProjectContext:
         if tags is not None:
             body["tags"] = tags
 
-        return self.brain._post(f"/api/v1/projects/{self.project_id}/memory/store", body)
+        return self.brain._post(f"/api/v1/projects/{self.project_id}/memory", body)
 
     def ingest(self, files: list[dict]) -> Dict[str, Any]:
         """Ingest files into project memory.

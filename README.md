@@ -8,7 +8,80 @@ Persistent memory for AI agents. 3 lines to give your agent a brain.
 pip install agentbay
 ```
 
-## Quick Start
+## Quick Start -- Auto-Memory (Recommended)
+
+The `chat()` method wraps your LLM call with automatic memory. No manual store/recall needed.
+
+```python
+from agentbay import AgentBay
+
+brain = AgentBay("ab_live_your_key", project_id="your-project-id")
+
+# Memory happens automatically -- no manual store/recall needed
+response = brain.chat([
+    {"role": "user", "content": "fix the auth session expiry bug"}
+])
+
+# brain.chat() automatically:
+# 1. Recalled relevant memories about auth and sessions
+# 2. Injected them into the LLM context
+# 3. Got the response from Claude
+# 4. Extracted learnings and stored them for next time
+```
+
+### Using OpenAI
+
+```python
+response = brain.chat(
+    [{"role": "user", "content": "refactor the payment module"}],
+    model="gpt-4o",
+    provider="openai",
+)
+```
+
+### Passing extra LLM parameters
+
+```python
+response = brain.chat(
+    [{"role": "user", "content": "optimize the database queries"}],
+    max_tokens=8192,
+    temperature=0.7,
+)
+```
+
+### Disabling auto-memory
+
+```python
+# Recall only (don't store new learnings)
+response = brain.chat(messages, auto_store=False)
+
+# Store only (don't inject recalled memories)
+response = brain.chat(messages, auto_recall=False)
+
+# No memory at all (just use as a plain LLM wrapper)
+response = brain.chat(messages, auto_recall=False, auto_store=False)
+```
+
+## Mem0-Compatible API
+
+If you're migrating from Mem0, AgentBay supports the same `add()` / `search()` interface:
+
+```python
+brain = AgentBay("ab_live_your_key", project_id="your-project-id")
+
+# Store with automatic type detection
+brain.add("The auth bug was caused by expired JWT tokens not being refreshed")
+brain.add("We decided to use PostgreSQL instead of MongoDB for ACID compliance")
+
+# Search
+results = brain.search("authentication issues")
+for r in results:
+    print(r["title"], r["confidence"])
+```
+
+## Manual Memory Control
+
+For full control, use `store()` and `recall()` directly:
 
 ```python
 from agentbay import AgentBay
@@ -32,7 +105,10 @@ brain.store("Always use UTC timestamps", title="Convention", type="PREFERENCE")
 
 | Method | What it does |
 |--------|-------------|
-| `brain.store(content, title, type, tier, tags)` | Save a memory |
+| `brain.chat(messages, model, provider, ...)` | LLM call with automatic memory |
+| `brain.add(data)` | Store with auto-detection (Mem0-compatible) |
+| `brain.search(query)` | Search memories (Mem0-compatible alias) |
+| `brain.store(content, title, type, tier, tags)` | Save a memory (full control) |
 | `brain.recall(query, limit, tier, tags)` | Search memories (semantic + keyword) |
 | `brain.forget(knowledge_id)` | Archive a memory |
 | `brain.verify(knowledge_id)` | Confirm a memory is still accurate |
@@ -46,6 +122,8 @@ brain.store("Always use UTC timestamps", title="Convention", type="PREFERENCE")
 - `PREFERENCE` -- User/agent preferences
 - `PROCEDURE` -- Step-by-step processes
 - `CONTEXT` -- Situational context
+- `PITFALL` -- Bugs, errors, and fixes to avoid
+- `DECISION` -- Architecture and design decisions
 
 ## With CrewAI
 
@@ -97,7 +175,7 @@ agent.run("Remember that deploys happen every Tuesday at 2pm UTC")
 ## Error Handling
 
 ```python
-from agentbay.client import AgentBayError, AuthenticationError, RateLimitError
+from agentbay import AgentBayError, AuthenticationError, RateLimitError
 
 try:
     results = brain.recall("query")
@@ -107,6 +185,24 @@ except RateLimitError:
     print("Slow down")
 except AgentBayError as e:
     print(f"Error {e.status_code}: {e}")
+```
+
+## Environment Variables
+
+For `chat()`, set your LLM provider API key:
+
+```bash
+# For Anthropic (default provider)
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# For OpenAI
+export OPENAI_API_KEY=sk-...
+```
+
+Or pass it directly:
+
+```python
+response = brain.chat(messages, api_key="sk-ant-...")
 ```
 
 ## Links

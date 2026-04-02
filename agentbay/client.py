@@ -2,12 +2,62 @@
 
 from __future__ import annotations
 
+import os
+import re
+import threading
 from typing import Any, Dict, List, Optional
 
 import requests
 from typing_extensions import TypeAlias
 
 MemoryEntry: TypeAlias = Dict[str, Any]
+
+# Patterns that suggest something worth storing
+_LEARNING_PATTERNS = re.compile(
+    r"(?:the (?:issue|problem|bug|error|fix|solution|cause|reason) (?:was|is))"
+    r"|(?:(?:we|i) (?:decided|chose|picked|went with|settled on))"
+    r"|(?:the pattern is)"
+    r"|(?:(?:always|never|make sure to|remember to|don't forget to))"
+    r"|(?:(?:turns out|it works because|the trick is|the key (?:insight|thing)))",
+    re.IGNORECASE,
+)
+
+# Patterns for auto-detecting memory type
+_PITFALL_PATTERNS = re.compile(
+    r"\b(?:bug|error|fix|crash|fail|broke|issue|problem|exception|traceback|stack\s*trace)\b",
+    re.IGNORECASE,
+)
+_DECISION_PATTERNS = re.compile(
+    r"\b(?:decided|chose|picked|went with|settled on|decision|choose|choosing)\b",
+    re.IGNORECASE,
+)
+_PROCEDURE_PATTERNS = re.compile(
+    r"\b(?:step\s*\d|first.*then|how to|procedure|process|workflow|instructions)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_type(text: str) -> str:
+    """Auto-detect memory type from content."""
+    if _PITFALL_PATTERNS.search(text):
+        return "PITFALL"
+    if _DECISION_PATTERNS.search(text):
+        return "DECISION"
+    if _PROCEDURE_PATTERNS.search(text):
+        return "PROCEDURE"
+    return "PATTERN"
+
+
+def _extract_title(text: str, max_len: int = 100) -> str:
+    """Extract a title from the first sentence or first N chars."""
+    # Try to get the first sentence
+    match = re.match(r"^(.+?[.!?])\s", text)
+    if match and len(match.group(1)) <= max_len:
+        return match.group(1)
+    # Fall back to first max_len chars
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rsplit(" ", 1)[0] + "..."
 
 
 class AgentBayError(Exception):
@@ -38,7 +88,14 @@ class AgentBay:
 
         from agentbay import AgentBay
 
-        brain = AgentBay("ab_live_your_key")
+        brain = AgentBay("ab_live_your_key", project_id="your-project-id")
+
+        # Auto-memory wrapper -- the simplest way to use AgentBay
+        response = brain.chat([
+            {"role": "user", "content": "fix the auth session expiry bug"}
+        ])
+
+        # Or manual control
         brain.store("Next.js 16 + Prisma + PostgreSQL", title="Project stack")
         results = brain.recall("What stack does this project use?")
 
@@ -73,6 +130,196 @@ class AgentBay:
                 "User-Agent": "agentbay-python/0.1.0",
             }
         )
+
+    # ------------------------------------------------------------------
+    # chat() -- The auto-memory LLM wrapper
+    # ------------------------------------------------------------------
+
+    def chat(
+        self,
+        messages: list[dict],
+        model: str = "claude-sonnet-4-20250514",
+        provider: str = "anthropic",
+        project_id: str | None = None,
+        user_id: str | None = None,
+        auto_recall: bool = True,
+        auto_store: bool = True,
+        recall_limit: int = 3,
+        **kwargs: Any,
+    ) -> Any:
+        """Wrap an LLM call with automatic memory recall and storage.
+
+        This is the primary way to use AgentBay. Wrap your LLM call and
+        memory happens automatically -- no manual store/recall needed.
+
+        Usage::
+
+            from agentbay import AgentBay
+
+            brain = AgentBay("ab_live_your_key", project_id="your-project-id")
+
+            # Anthropic (default)
+            response = brain.chat([
+                {"role": "user", "content": "fix the auth session expiry bug"}
+            ])
+
+            # OpenAI
+            response = brain.chat(
+                [{"role": "user", "content": "refactor the payment module"}],
+                model="gpt-4o",
+                provider="openai",
+            )
+
+            # With extra LLM parameters
+            response = brain.chat(
+                [{"role": "user", "content": "optimize the database queries"}],
+                max_tokens=4096,
+                temperature=0.7,
+            )
+
+        What happens under the hood:
+
+        1. **Auto-recall**: The last user message is used to search your
+           Knowledge Brain. Relevant memories are injected as context.
+        2. **LLM call**: The enriched messages are sent to your chosen provider.
+        3. **Auto-store**: The assistant response is scanned for learnings
+           (bug fixes, decisions, patterns) and stored automatically.
+
+        Args:
+            messages: Chat messages in OpenAI format
+                (``[{"role": "user", "content": "..."}]``).
+            model: Model name to use. Defaults to ``claude-sonnet-4-20250514``.
+            provider: ``"anthropic"`` or ``"openai"``. Defaults to ``"anthropic"``.
+            project_id: Project for memory ops (overrides default).
+            user_id: Optional user ID for memory scoping.
+            auto_recall: Whether to recall relevant memories. Defaults to True.
+            auto_store: Whether to store learnings from the response. Defaults to True.
+            recall_limit: Maximum memories to recall (1-10). Defaults to 3.
+            **kwargs: Extra keyword arguments passed to the LLM client
+                (e.g. ``max_tokens``, ``temperature``, ``api_key``).
+
+        Returns:
+            The raw LLM response object (Anthropic ``Message`` or OpenAI
+            ``ChatCompletion``). Memory operations are a side effect.
+
+        Raises:
+            AgentBayError: If memory operations fail (LLM call still proceeds).
+            ImportError: If the provider library is not installed.
+        """
+        pid = self._resolve_project(project_id)
+
+        # --- 1. Auto-recall ---
+        enriched_messages = list(messages)  # shallow copy
+        memory_context = ""
+        if auto_recall:
+            last_user_msg = self._extract_last_user_message(messages)
+            if last_user_msg:
+                try:
+                    memories = self.recall(last_user_msg, project_id=pid, limit=recall_limit)
+                    if memories:
+                        memory_context = self._format_memory_context(memories)
+                        enriched_messages = self._inject_memory_context(enriched_messages, memory_context, provider)
+                except Exception:
+                    # Memory recall failed -- proceed without it
+                    pass
+
+        # --- 2. Call the LLM ---
+        response = self._call_llm(enriched_messages, model, provider, **kwargs)
+
+        # --- 3. Auto-store (fire-and-forget in background thread) ---
+        if auto_store:
+            last_user_msg = self._extract_last_user_message(messages)
+            assistant_text = self._extract_response_text(response, provider)
+            if last_user_msg and assistant_text:
+                thread = threading.Thread(
+                    target=self._auto_store_learnings,
+                    args=(last_user_msg, assistant_text, pid),
+                    daemon=True,
+                )
+                thread.start()
+
+        return response
+
+    # ------------------------------------------------------------------
+    # add() -- Mem0-compatible simple store
+    # ------------------------------------------------------------------
+
+    def add(
+        self,
+        data: str,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        project_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> MemoryEntry:
+        """Store a memory with automatic type detection and title extraction.
+
+        This is the Mem0-compatible API. Pass a string and AgentBay
+        figures out the rest.
+
+        Usage::
+
+            brain.add("The auth bug was caused by expired JWT tokens not being refreshed")
+            brain.add("We decided to use PostgreSQL instead of MongoDB for ACID compliance")
+            brain.add("Always run migrations before deploying to staging")
+
+        Args:
+            data: The knowledge content to store.
+            user_id: Optional user ID for scoping.
+            agent_id: Optional agent ID for scoping.
+            project_id: Project to store in (overrides default).
+            metadata: Optional extra metadata dict to include.
+
+        Returns:
+            Dict with the created entry, including its ``id``.
+        """
+        pid = self._resolve_project(project_id)
+        entry_type = _detect_type(data)
+        title = _extract_title(data)
+
+        body: Dict[str, Any] = {
+            "content": data,
+            "type": entry_type,
+            "tier": "semantic",
+            "title": title,
+            "source": "sdk-auto",
+        }
+        if metadata:
+            body["metadata"] = metadata
+
+        return self._post(f"/api/v1/projects/{pid}/memory/store", body)
+
+    # ------------------------------------------------------------------
+    # search() -- Mem0-compatible recall alias
+    # ------------------------------------------------------------------
+
+    def search(
+        self,
+        query: str,
+        user_id: str | None = None,
+        project_id: str | None = None,
+        limit: int = 5,
+    ) -> List[MemoryEntry]:
+        """Search memories by semantic similarity.
+
+        This is an alias for :meth:`recall` for Mem0 compatibility.
+
+        Usage::
+
+            results = brain.search("authentication issues")
+            for r in results:
+                print(r["title"], r["confidence"])
+
+        Args:
+            query: Natural-language search query.
+            user_id: Optional user ID for scoping.
+            project_id: Project to search in (overrides default).
+            limit: Maximum number of results (1-50). Defaults to 5.
+
+        Returns:
+            List of matching entries with confidence scores.
+        """
+        return self.recall(query, project_id=project_id, limit=limit)
 
     # ------------------------------------------------------------------
     # Core memory operations
@@ -230,6 +477,197 @@ class AgentBay:
             self.project_id = project_id
 
         return resp
+
+    # ------------------------------------------------------------------
+    # chat() helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_last_user_message(messages: list[dict]) -> str | None:
+        """Get the text of the last user message."""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content
+                # Handle Anthropic-style content blocks
+                if isinstance(content, list):
+                    texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                    return " ".join(texts) if texts else None
+                return None
+        return None
+
+    @staticmethod
+    def _format_memory_context(memories: list[dict]) -> str:
+        """Format recalled memories into a context string."""
+        lines = ["[Memory context -- AgentBay recalled these relevant memories:]"]
+        for mem in memories:
+            title = mem.get("title", "Untitled")
+            entry_type = mem.get("type", "PATTERN")
+            confidence = mem.get("confidence", mem.get("score", 0))
+            # Confidence may be 0-1 float or 0-100 int
+            if isinstance(confidence, (int, float)) and confidence <= 1:
+                confidence = int(confidence * 100)
+            content = mem.get("content", "")
+            lines.append(f"## {title} ({entry_type}, confidence: {confidence}%)")
+            lines.append(content)
+            lines.append("---")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _inject_memory_context(messages: list[dict], context: str, provider: str) -> list[dict]:
+        """Inject memory context into the messages list."""
+        enriched = list(messages)
+
+        if provider == "anthropic":
+            # For Anthropic, prepend as the first user message with context
+            # or inject into existing system parameter (handled by caller via kwargs)
+            # Simplest: insert a user message with context at the beginning,
+            # followed by an assistant ack, before the real conversation.
+            # But cleaner: prepend to the first user message.
+            for i, msg in enumerate(enriched):
+                if msg.get("role") == "user":
+                    original_content = msg.get("content", "")
+                    if isinstance(original_content, str):
+                        enriched[i] = {
+                            **msg,
+                            "content": f"{context}\n\n{original_content}",
+                        }
+                    break
+            else:
+                # No user message found, prepend one
+                enriched.insert(0, {"role": "user", "content": context})
+        else:
+            # For OpenAI-style, inject as system message
+            if enriched and enriched[0].get("role") == "system":
+                enriched[0] = {
+                    **enriched[0],
+                    "content": f"{context}\n\n{enriched[0].get('content', '')}",
+                }
+            else:
+                enriched.insert(0, {"role": "system", "content": context})
+
+        return enriched
+
+    @staticmethod
+    def _call_llm(messages: list[dict], model: str, provider: str, **kwargs: Any) -> Any:
+        """Call the LLM provider. Imports the library dynamically."""
+        if provider == "anthropic":
+            try:
+                import anthropic
+            except ImportError:
+                raise ImportError(
+                    "The 'anthropic' package is required for provider='anthropic'. "
+                    "Install it with: pip install anthropic"
+                )
+            api_key = kwargs.pop("api_key", None) or os.environ.get("ANTHROPIC_API_KEY")
+            if not api_key:
+                raise AgentBayError(
+                    "ANTHROPIC_API_KEY environment variable is required, "
+                    "or pass api_key= to chat()."
+                )
+
+            # Anthropic uses 'system' as a top-level param, not in messages
+            system_text = None
+            anthropic_messages = []
+            for msg in messages:
+                if msg.get("role") == "system":
+                    system_text = msg.get("content", "")
+                else:
+                    anthropic_messages.append(msg)
+
+            client = anthropic.Anthropic(api_key=api_key)
+
+            call_kwargs: Dict[str, Any] = {
+                "model": model,
+                "messages": anthropic_messages,
+            }
+            if system_text:
+                call_kwargs["system"] = system_text
+            if "max_tokens" not in kwargs:
+                kwargs["max_tokens"] = 4096
+
+            call_kwargs.update(kwargs)
+            return client.messages.create(**call_kwargs)
+
+        elif provider == "openai":
+            try:
+                import openai
+            except ImportError:
+                raise ImportError(
+                    "The 'openai' package is required for provider='openai'. "
+                    "Install it with: pip install openai"
+                )
+            api_key = kwargs.pop("api_key", None) or os.environ.get("OPENAI_API_KEY")
+            if not api_key:
+                raise AgentBayError(
+                    "OPENAI_API_KEY environment variable is required, "
+                    "or pass api_key= to chat()."
+                )
+
+            client = openai.OpenAI(api_key=api_key)
+            call_kwargs = {
+                "model": model,
+                "messages": messages,
+            }
+            call_kwargs.update(kwargs)
+            return client.chat.completions.create(**call_kwargs)
+
+        else:
+            raise AgentBayError(
+                f"Unknown provider '{provider}'. Supported: 'anthropic', 'openai'."
+            )
+
+    @staticmethod
+    def _extract_response_text(response: Any, provider: str) -> str | None:
+        """Extract the text content from an LLM response."""
+        try:
+            if provider == "anthropic":
+                # Anthropic Message object
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        return block.text
+                return None
+            elif provider == "openai":
+                # OpenAI ChatCompletion
+                return response.choices[0].message.content
+        except (AttributeError, IndexError, TypeError):
+            return None
+        return None
+
+    def _auto_store_learnings(self, user_msg: str, assistant_text: str, project_id: str) -> None:
+        """Extract and store learnings from a conversation (runs in background)."""
+        try:
+            # Check if the response contains something worth storing
+            if not _LEARNING_PATTERNS.search(assistant_text):
+                return
+
+            # Extract the most relevant paragraph containing the learning
+            paragraphs = assistant_text.split("\n\n")
+            best_paragraph = ""
+            for para in paragraphs:
+                if _LEARNING_PATTERNS.search(para):
+                    best_paragraph = para.strip()
+                    break
+
+            if not best_paragraph:
+                best_paragraph = assistant_text[:500]
+
+            # Build a concise memory entry
+            entry_type = _detect_type(best_paragraph)
+            title = _extract_title(best_paragraph)
+            content = f"Q: {user_msg[:200]}\nA: {best_paragraph[:800]}"
+
+            self.store(
+                content=content,
+                title=title,
+                project_id=project_id,
+                type=entry_type,
+                tags=["auto-learned", "chat"],
+            )
+        except Exception:
+            # Fire-and-forget -- never crash the caller
+            pass
 
     # ------------------------------------------------------------------
     # Internal helpers

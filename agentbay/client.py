@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -894,6 +896,131 @@ class AgentBay:
         if not self._is_local:
             raise AgentBayError("Already using cloud mode")
         return self._local.upgrade(api_key, project_id)
+
+    def login(self, migrate: bool = True) -> "AgentBay":
+        """Log in via browser — opens signup/login page, waits for API key.
+
+        Opens your browser to AgentBay registration. After you sign up or
+        log in and create an API key, paste it back in the terminal.
+        Optionally migrates all local memories to your new cloud account.
+
+        Usage::
+
+            brain = AgentBay()  # local mode
+            brain.store("my pattern", title="test")
+
+            # Ready for cloud? One command:
+            brain = brain.login()
+            # Opens browser → you sign up → paste key → done
+            # All local memories are now in the cloud
+
+        Returns:
+            A cloud :class:`AgentBay` instance.
+        """
+        import webbrowser
+
+        base = self.base_url if hasattr(self, 'base_url') and self.base_url else "https://www.aiagentsbay.com"
+        url = f"{base}/register?utm_source=sdk&utm_medium=login"
+
+        print("\n🧠 AgentBay Login")
+        print("=" * 40)
+        print(f"Opening {base}/register in your browser...")
+        print()
+
+        try:
+            webbrowser.open(url)
+        except Exception:
+            print(f"Could not open browser. Go to: {url}")
+
+        print("Steps:")
+        print("  1. Sign up or log in")
+        print("  2. Go to Dashboard → API Keys")
+        print("  3. Create a new key")
+        print("  4. Copy the key (starts with ab_live_)")
+        print()
+
+        api_key = input("Paste your API key here: ").strip()
+
+        if not api_key or not api_key.startswith("ab_live_"):
+            raise AgentBayError("Invalid API key. Must start with 'ab_live_'")
+
+        # Verify the key works
+        import requests
+        try:
+            resp = requests.get(
+                f"{base}/api/v1/me",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                raise AgentBayError(f"API key verification failed (HTTP {resp.status_code})")
+            user = resp.json()
+            print(f"\n✓ Logged in as {user.get('name', user.get('email', 'unknown'))}")
+        except requests.RequestException as e:
+            raise AgentBayError(f"Could not verify API key: {e}")
+
+        # Save key locally for future sessions
+        config_dir = Path.home() / ".agentbay"
+        config_dir.mkdir(exist_ok=True)
+        config_file = config_dir / "config.json"
+        config = {}
+        if config_file.exists():
+            try:
+                config = json.loads(config_file.read_text())
+            except Exception:
+                pass
+        config["apiKey"] = api_key
+        config["baseUrl"] = base
+        config_file.write_text(json.dumps(config, indent=2))
+        print(f"✓ Key saved to {config_file}")
+
+        # Migrate local memories if requested
+        if migrate and self._is_local and self._local:
+            cloud = self._local.upgrade(api_key)
+            print(f"✓ Local memories migrated to cloud")
+            return cloud
+
+        cloud = AgentBay(api_key, base_url=base)
+        print(f"\n✓ Ready! You're now using AgentBay cloud.")
+        return cloud
+
+    @staticmethod
+    def from_saved() -> "AgentBay":
+        """Load AgentBay from saved config (~/.agentbay/config.json).
+
+        If you previously ran ``brain.login()``, the API key was saved.
+        This loads it so you don't have to pass the key every time.
+
+        Usage::
+
+            brain = AgentBay.from_saved()  # uses saved key
+            brain.recall("my patterns")
+
+        Returns:
+            A cloud :class:`AgentBay` instance.
+
+        Raises:
+            AgentBayError: If no saved config found.
+        """
+        config_file = Path.home() / ".agentbay" / "config.json"
+        if not config_file.exists():
+            raise AgentBayError(
+                "No saved config found. Run brain.login() first, or pass an API key."
+            )
+        try:
+            config = json.loads(config_file.read_text())
+        except Exception as e:
+            raise AgentBayError(f"Could not read config: {e}")
+
+        api_key = config.get("apiKey")
+        if not api_key:
+            raise AgentBayError("No API key in saved config. Run brain.login() first.")
+
+        return AgentBay(
+            api_key=api_key,
+            base_url=config.get("baseUrl", "https://www.aiagentsbay.com"),
+            project_id=config.get("projectId"),
+        )
 
     def __repr__(self) -> str:
         if self._is_local:

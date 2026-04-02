@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentbay"
-version = "0.3.1"
+version = "0.4.0"
 description = "Persistent memory for AI agents. Store, recall, and share knowledge across sessions."
 readme = "README.md"
 license = "MIT"
@@ -32,9 +32,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-crewai = ["crewai>=0.1"]
-langchain = ["langchain-core>=0.1"]
-all = ["crewai>=0.1", "langchain-core>=0.1"]
+crewai = ["crewai>=0.50"]
+langchain = ["langchain-core>=0.2"]
+autogen = ["autogen-agentchat>=0.2"]
+all = ["crewai>=0.50", "langchain-core>=0.2", "autogen-agentchat>=0.2"]
 
 [project.urls]
 Homepage = "https://www.aiagentsbay.com"

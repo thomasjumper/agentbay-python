@@ -109,14 +109,26 @@ class AgentBay:
 
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None = None,
         base_url: str = "https://www.aiagentsbay.com",
         project_id: str | None = None,
         timeout: int = 30,
     ) -> None:
         if not api_key:
-            raise AuthenticationError("api_key is required. Get one at https://www.aiagentsbay.com/dashboard")
+            # Local mode -- no cloud, SQLite only
+            from .local import LocalMemory
 
+            self._local = LocalMemory()
+            self._is_local = True
+            self.api_key = None
+            self.project_id = None
+            self.base_url = base_url
+            self.timeout = timeout
+            self._session = None
+            return
+
+        self._local = None
+        self._is_local = False
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.project_id = project_id
@@ -206,7 +218,7 @@ class AgentBay:
             AgentBayError: If memory operations fail (LLM call still proceeds).
             ImportError: If the provider library is not installed.
         """
-        pid = self._resolve_project(project_id)
+        pid = None if self._is_local else self._resolve_project(project_id)
 
         # --- 1. Auto-recall ---
         enriched_messages = list(messages)  # shallow copy
@@ -215,7 +227,10 @@ class AgentBay:
             last_user_msg = self._extract_last_user_message(messages)
             if last_user_msg:
                 try:
-                    memories = self.recall(last_user_msg, project_id=pid, limit=recall_limit)
+                    if self._is_local:
+                        memories = self._local.recall(last_user_msg, limit=recall_limit, user_id=user_id)
+                    else:
+                        memories = self.recall(last_user_msg, project_id=pid, limit=recall_limit, user_id=user_id)
                     if memories:
                         memory_context = self._format_memory_context(memories)
                         enriched_messages = self._inject_memory_context(enriched_messages, memory_context, provider)
@@ -273,6 +288,9 @@ class AgentBay:
         Returns:
             Dict with the created entry, including its ``id``.
         """
+        if self._is_local:
+            return self._local.add(data, user_id=user_id)
+
         pid = self._resolve_project(project_id)
         entry_type = _detect_type(data)
         title = _extract_title(data)
@@ -319,7 +337,9 @@ class AgentBay:
         Returns:
             List of matching entries with confidence scores.
         """
-        return self.recall(query, project_id=project_id, limit=limit)
+        if self._is_local:
+            return self._local.search(query, user_id=user_id, limit=limit)
+        return self.recall(query, project_id=project_id, limit=limit, user_id=user_id)
 
     # ------------------------------------------------------------------
     # Core memory operations
@@ -333,6 +353,7 @@ class AgentBay:
         type: str = "PATTERN",
         tier: str = "semantic",
         tags: list[str] | None = None,
+        user_id: str | None = None,
     ) -> MemoryEntry:
         """Store a memory in your Knowledge Brain.
 
@@ -343,6 +364,7 @@ class AgentBay:
             type: Entry type -- PATTERN, FACT, PREFERENCE, PROCEDURE, CONTEXT.
             tier: Storage tier -- semantic, episodic, procedural.
             tags: Optional list of tags for categorization.
+            user_id: Optional user ID for scoping. Stored as a ``user:<id>`` tag.
 
         Returns:
             Dict with the created entry, including its ``id``.
@@ -350,6 +372,12 @@ class AgentBay:
         Raises:
             AgentBayError: If the request fails.
         """
+        if self._is_local:
+            return self._local.store(
+                content, title=title, type=type, tier=tier,
+                tags=tags, user_id=user_id,
+            )
+
         pid = self._resolve_project(project_id)
         body: Dict[str, Any] = {
             "content": content,
@@ -358,8 +386,13 @@ class AgentBay:
         }
         if title is not None:
             body["title"] = title
-        if tags is not None:
-            body["tags"] = tags
+
+        # Merge user_id into tags as user:<id>
+        effective_tags = list(tags) if tags else []
+        if user_id is not None:
+            effective_tags.append(f"user:{user_id}")
+        if effective_tags:
+            body["tags"] = effective_tags
 
         return self._post(f"/api/v1/projects/{pid}/memory", body)
 
@@ -370,6 +403,7 @@ class AgentBay:
         limit: int = 5,
         tier: str | None = None,
         tags: list[str] | None = None,
+        user_id: str | None = None,
     ) -> List[MemoryEntry]:
         """Search memories by semantic similarity.
 
@@ -379,25 +413,29 @@ class AgentBay:
             limit: Maximum number of results (1-50). Defaults to 5.
             tier: Filter by storage tier.
             tags: Filter by tags.
+            user_id: Optional user ID for scoping. Filters to ``user:<id>`` tagged entries.
 
         Returns:
             List of matching entries with confidence scores.
         """
+        if self._is_local:
+            return self._local.recall(
+                query, limit=limit, user_id=user_id,
+                type=None, tags=tags,
+            )
+
         pid = self._resolve_project(project_id)
-        body: Dict[str, Any] = {
-            "query": query,
-            "limit": limit,
-        }
-        if tier is not None:
-            body["tier"] = tier
-        if tags is not None:
-            body["tags"] = tags
+
+        # Merge user_id into tags filter
+        effective_tags = list(tags) if tags else []
+        if user_id is not None:
+            effective_tags.append(f"user:{user_id}")
 
         params: Dict[str, Any] = {"q": query, "limit": str(limit)}
         if tier is not None:
             params["tier"] = tier
-        if tags is not None:
-            params["tags"] = ",".join(tags)
+        if effective_tags:
+            params["tags"] = ",".join(effective_tags)
         resp = self._get(f"/api/v1/projects/{pid}/memory", params)
         if isinstance(resp, list):
             return resp
@@ -414,6 +452,9 @@ class AgentBay:
             knowledge_id: The ID of the memory to archive.
             project_id: Project containing the entry (overrides default).
         """
+        if self._is_local:
+            self._local.forget(knowledge_id)
+            return
         pid = self._resolve_project(project_id)
         self._delete(f"/api/v1/projects/{pid}/memory", {"knowledgeId": knowledge_id})
 
@@ -445,6 +486,8 @@ class AgentBay:
         Returns:
             Dict with health metrics.
         """
+        if self._is_local:
+            return self._local.health()
         pid = self._resolve_project(project_id)
         return self._get(f"/api/v1/projects/{pid}/memory", {"action": "health"})
 
@@ -639,7 +682,7 @@ class AgentBay:
             return None
         return None
 
-    def _auto_store_learnings(self, user_msg: str, assistant_text: str, project_id: str) -> None:
+    def _auto_store_learnings(self, user_msg: str, assistant_text: str, project_id: str | None) -> None:
         """Extract and store learnings from a conversation (runs in background)."""
         try:
             # Check if the response contains something worth storing
@@ -662,13 +705,21 @@ class AgentBay:
             title = _extract_title(best_paragraph)
             content = f"Q: {user_msg[:200]}\nA: {best_paragraph[:800]}"
 
-            self.store(
-                content=content,
-                title=title,
-                project_id=project_id,
-                type=entry_type,
-                tags=["auto-learned", "chat"],
-            )
+            if self._is_local:
+                self._local.store(
+                    content=content,
+                    title=title,
+                    type=entry_type,
+                    tags=["auto-learned", "chat"],
+                )
+            else:
+                self.store(
+                    content=content,
+                    title=title,
+                    project_id=project_id,
+                    type=entry_type,
+                    tags=["auto-learned", "chat"],
+                )
         except Exception:
             # Fire-and-forget -- never crash the caller
             pass
@@ -823,7 +874,30 @@ class AgentBay:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def upgrade(self, api_key: str, project_id: str | None = None) -> "AgentBay":
+        """Upgrade from local to cloud. Migrates all local memories.
+
+        Reads every entry from the local SQLite store and uploads it to
+        the cloud Knowledge Brain via the API. Returns a new cloud-mode
+        :class:`AgentBay` instance.
+
+        Args:
+            api_key: Your AgentBay API key.
+            project_id: Cloud project ID to migrate into.
+
+        Returns:
+            A cloud :class:`AgentBay` instance with all local memories migrated.
+
+        Raises:
+            AgentBayError: If already using cloud mode.
+        """
+        if not self._is_local:
+            raise AgentBayError("Already using cloud mode")
+        return self._local.upgrade(api_key, project_id)
+
     def __repr__(self) -> str:
+        if self._is_local:
+            return f"AgentBay(mode='local', db='{self._local.db_path}')"
         masked = f"{self.api_key[:8]}...{self.api_key[-4:]}" if len(self.api_key) > 12 else "***"
         return f"AgentBay(api_key='{masked}', project_id={self.project_id!r})"
 

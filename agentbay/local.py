@@ -178,10 +178,21 @@ class LocalMemory:
                 params,
             ).fetchall()
 
-        # Keyword scoring
+        # Enhanced local search: TF-IDF inspired scoring + fuzzy matching
         words = [w.lower() for w in re.split(r"\W+", query) if len(w) >= 2]
         if not words:
             return []
+
+        # Build document frequency for IDF-like weighting
+        doc_count = len(rows) or 1
+        word_doc_freq: dict[str, int] = {}
+        for w in words:
+            count = 0
+            for row in rows:
+                text = (dict(row)["title"] + " " + dict(row)["content"]).lower()
+                if w in text:
+                    count += 1
+            word_doc_freq[w] = max(count, 1)
 
         # Tag filter (post-query since tags are JSON)
         filter_tags = set(tags or [])
@@ -197,15 +208,44 @@ class LocalMemory:
 
             title_lower = row_dict["title"].lower()
             content_lower = row_dict["content"].lower()
+            tags_lower = " ".join(entry_tags).lower()
+            full_text = title_lower + " " + content_lower + " " + tags_lower
             score = 0.0
+
             for w in words:
+                # IDF weight: rare words score higher
+                import math
+                idf = math.log(doc_count / word_doc_freq.get(w, 1)) + 1
+
+                # Exact match in title (highest weight)
                 if w in title_lower:
-                    score += 2.0
+                    score += 3.0 * idf
+                # Exact match in tags
+                if w in tags_lower:
+                    score += 2.0 * idf
+                # Exact match in content with TF component
                 if w in content_lower:
-                    score += 1.0
+                    # Term frequency: diminishing returns on repeated matches
+                    tf = content_lower.count(w)
+                    score += (1 + math.log(tf)) * idf if tf > 0 else 0
+
+                # Fuzzy match: substring containment (partial word matching)
+                elif len(w) >= 4:
+                    for text_word in re.split(r"\W+", full_text):
+                        if len(text_word) >= 4 and (w in text_word or text_word in w):
+                            score += 0.5 * idf
+                            break
+
+            # Confidence boost: higher confidence entries rank higher
+            conf = row_dict.get("confidence", 0.5)
+            score *= (0.5 + 0.5 * conf)
+
+            # Recency boost: recently accessed entries get a small bump
+            access_count = row_dict.get("access_count", 0)
+            if access_count > 0:
+                score *= (1 + min(access_count, 10) * 0.02)
 
             if score > 0:
-                # Bump access count
                 scored.append((score, {
                     "id": row_dict["id"],
                     "title": row_dict["title"],

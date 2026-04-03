@@ -50,6 +50,54 @@ def _detect_type(text: str) -> str:
     return "PATTERN"
 
 
+# ---------------------------------------------------------------------------
+# Supported LLM providers
+# ---------------------------------------------------------------------------
+
+SUPPORTED_PROVIDERS = {
+    # Tier 1 — Major cloud providers
+    "anthropic": {"name": "anthropic", "module": "anthropic", "default_model": "claude-sonnet-4-20250514"},
+    "openai": {"name": "openai", "module": "openai", "default_model": "gpt-4o"},
+    "google": {"name": "google", "module": "google.generativeai", "default_model": "gemini-2.5-flash"},
+    "xai": {"name": "xai", "module": "openai", "default_model": "grok-3-mini", "base_url": "https://api.x.ai/v1"},
+
+    # Tier 2 — AI API providers (OpenAI-compatible)
+    "mistral": {"name": "mistral", "module": "openai", "default_model": "mistral-large-latest", "base_url": "https://api.mistral.ai/v1"},
+    "cohere": {"name": "cohere", "module": "cohere", "default_model": "command-r-plus"},
+    "deepseek": {"name": "deepseek", "module": "openai", "default_model": "deepseek-chat", "base_url": "https://api.deepseek.com/v1"},
+    "together": {"name": "together", "module": "openai", "default_model": "meta-llama/Llama-3.3-70B-Instruct", "base_url": "https://api.together.xyz/v1"},
+    "fireworks": {"name": "fireworks", "module": "openai", "default_model": "accounts/fireworks/models/llama-v3p3-70b-instruct", "base_url": "https://api.fireworks.ai/inference/v1"},
+    "groq": {"name": "groq", "module": "openai", "default_model": "llama-3.3-70b-versatile", "base_url": "https://api.groq.com/openai/v1"},
+    "perplexity": {"name": "perplexity", "module": "openai", "default_model": "sonar-pro", "base_url": "https://api.perplexity.ai"},
+
+    # Tier 3 — Enterprise/cloud
+    "azure": {"name": "azure", "module": "openai", "default_model": "gpt-4o"},  # uses AZURE_OPENAI_ENDPOINT
+    "bedrock": {"name": "bedrock", "module": "anthropic", "default_model": "claude-sonnet-4-20250514"},  # AWS Bedrock
+
+    # Tier 4 — Local
+    "ollama": {"name": "ollama", "module": "openai", "default_model": "llama3.3", "base_url": "http://localhost:11434/v1"},
+    "lmstudio": {"name": "lmstudio", "module": "openai", "default_model": "local-model", "base_url": "http://localhost:1234/v1"},
+    "llamacpp": {"name": "llamacpp", "module": "openai", "default_model": "local", "base_url": "http://localhost:8080/v1"},
+}
+
+# Env var name for each provider's API key
+_PROVIDER_KEY_MAP = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "xai": "XAI_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "cohere": "COHERE_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "fireworks": "FIREWORKS_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "perplexity": "PERPLEXITY_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
+    "bedrock": "AWS_ACCESS_KEY_ID",
+}
+
+
 def _extract_title(text: str, max_len: int = 100) -> str:
     """Extract a title from the first sentence or first N chars."""
     # Try to get the first sentence
@@ -152,8 +200,8 @@ class AgentBay:
     def chat(
         self,
         messages: list[dict],
-        model: str = "claude-sonnet-4-20250514",
-        provider: str = "anthropic",
+        model: str | None = None,
+        provider: str = "auto",
         project_id: str | None = None,
         user_id: str | None = None,
         auto_recall: bool = True,
@@ -166,16 +214,25 @@ class AgentBay:
         This is the primary way to use AgentBay. Wrap your LLM call and
         memory happens automatically -- no manual store/recall needed.
 
+        Supports 20+ LLM providers. Most are OpenAI-compatible and only
+        need the ``openai`` package plus the right API key.
+
         Usage::
 
             from agentbay import AgentBay
 
             brain = AgentBay("ab_live_your_key", project_id="your-project-id")
 
-            # Anthropic (default)
+            # Auto-detect provider from available API keys (default)
             response = brain.chat([
                 {"role": "user", "content": "fix the auth session expiry bug"}
             ])
+
+            # Anthropic
+            response = brain.chat(
+                [{"role": "user", "content": "fix the auth bug"}],
+                provider="anthropic",
+            )
 
             # OpenAI
             response = brain.chat(
@@ -184,12 +241,31 @@ class AgentBay:
                 provider="openai",
             )
 
-            # With extra LLM parameters
+            # xAI (Grok) -- uses OpenAI-compatible API
             response = brain.chat(
-                [{"role": "user", "content": "optimize the database queries"}],
-                max_tokens=4096,
-                temperature=0.7,
+                [{"role": "user", "content": "explain quantum computing"}],
+                provider="xai",
             )
+
+            # Groq, DeepSeek, Together, Fireworks, Perplexity, Mistral...
+            response = brain.chat(messages, provider="groq")
+            response = brain.chat(messages, provider="deepseek")
+            response = brain.chat(messages, provider="together")
+
+            # Local LLMs (Ollama, LM Studio, llama.cpp)
+            response = brain.chat(messages, provider="ollama")
+            response = brain.chat(messages, provider="lmstudio")
+
+            # Google Gemini
+            response = brain.chat(messages, provider="google")
+
+        Supported providers:
+
+        - **Tier 1 (major clouds)**: ``anthropic``, ``openai``, ``google``, ``xai``
+        - **Tier 2 (API providers)**: ``mistral``, ``cohere``, ``deepseek``,
+          ``together``, ``fireworks``, ``groq``, ``perplexity``
+        - **Tier 3 (enterprise)**: ``azure``, ``bedrock``
+        - **Tier 4 (local)**: ``ollama``, ``lmstudio``, ``llamacpp``
 
         What happens under the hood:
 
@@ -202,8 +278,9 @@ class AgentBay:
         Args:
             messages: Chat messages in OpenAI format
                 (``[{"role": "user", "content": "..."}]``).
-            model: Model name to use. Defaults to ``claude-sonnet-4-20250514``.
-            provider: ``"anthropic"`` or ``"openai"``. Defaults to ``"anthropic"``.
+            model: Model name to use. If None, uses the provider's default model.
+            provider: LLM provider name or ``"auto"`` to detect from env vars.
+                Defaults to ``"auto"``.
             project_id: Project for memory ops (overrides default).
             user_id: Optional user ID for memory scoping.
             auto_recall: Whether to recall relevant memories. Defaults to True.
@@ -213,13 +290,26 @@ class AgentBay:
                 (e.g. ``max_tokens``, ``temperature``, ``api_key``).
 
         Returns:
-            The raw LLM response object (Anthropic ``Message`` or OpenAI
-            ``ChatCompletion``). Memory operations are a side effect.
+            The raw LLM response object (Anthropic ``Message``, OpenAI
+            ``ChatCompletion``, Google ``GenerateContentResponse``, or
+            Cohere ``ChatResponse``). Memory operations are a side effect.
 
         Raises:
             AgentBayError: If memory operations fail (LLM call still proceeds).
             ImportError: If the provider library is not installed.
         """
+        # --- 0. Resolve provider & model ---
+        if provider == "auto":
+            provider = self._detect_provider()
+
+        config = SUPPORTED_PROVIDERS.get(provider)
+        if not config:
+            raise AgentBayError(
+                f"Unsupported provider: '{provider}'. "
+                f"Supported: {list(SUPPORTED_PROVIDERS.keys())}"
+            )
+        model = model or config["default_model"]
+
         pid = None if self._is_local else self._resolve_project(project_id)
 
         # --- 1. Auto-recall ---
@@ -599,86 +689,331 @@ class AgentBay:
         return enriched
 
     @staticmethod
+    def _detect_provider() -> str:
+        """Auto-detect the best available LLM provider from env vars or local servers."""
+        # Check cloud providers in priority order
+        for provider, env_var in _PROVIDER_KEY_MAP.items():
+            if os.environ.get(env_var):
+                return provider
+
+        # Check for local LLMs
+        try:
+            import requests as _req
+            if _req.get("http://localhost:11434/api/tags", timeout=1).status_code == 200:
+                return "ollama"
+        except Exception:
+            pass
+        try:
+            import requests as _req
+            if _req.get("http://localhost:1234/v1/models", timeout=1).status_code == 200:
+                return "lmstudio"
+        except Exception:
+            pass
+        try:
+            import requests as _req
+            if _req.get("http://localhost:8080/v1/models", timeout=1).status_code == 200:
+                return "llamacpp"
+        except Exception:
+            pass
+
+        raise AgentBayError(
+            "No LLM provider detected. Set an API key env var "
+            "(ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, etc.) "
+            "or run a local LLM server (Ollama, LM Studio, llama.cpp)."
+        )
+
+    @staticmethod
+    def _get_provider_key(config: dict, **kwargs: Any) -> str:
+        """Get the API key for a provider from kwargs or env vars."""
+        # Explicit api_key always wins
+        api_key = kwargs.get("api_key")
+        if api_key:
+            return api_key
+
+        provider_name = config.get("name", "")
+
+        # Try provider-specific env var
+        env_var = _PROVIDER_KEY_MAP.get(provider_name)
+        if env_var:
+            val = os.environ.get(env_var)
+            if val:
+                return val
+
+        # For OpenAI-compatible providers, fall back to OPENAI_API_KEY
+        if config.get("module") == "openai" and provider_name != "openai":
+            val = os.environ.get("OPENAI_API_KEY")
+            if val:
+                return val
+
+        # Local providers don't need a key
+        base_url = config.get("base_url", "")
+        if base_url.startswith("http://localhost"):
+            return "not-needed"
+
+        raise AgentBayError(
+            f"No API key found for provider '{provider_name}'. "
+            f"Set {_PROVIDER_KEY_MAP.get(provider_name, 'the appropriate env var')} "
+            f"or pass api_key= to chat()."
+        )
+
+    @staticmethod
     def _call_llm(messages: list[dict], model: str, provider: str, **kwargs: Any) -> Any:
-        """Call the LLM provider. Imports the library dynamically."""
-        if provider == "anthropic":
-            try:
-                import anthropic
-            except ImportError:
-                raise ImportError(
-                    "The 'anthropic' package is required for provider='anthropic'. "
-                    "Install it with: pip install anthropic"
-                )
-            api_key = kwargs.pop("api_key", None) or os.environ.get("ANTHROPIC_API_KEY")
-            if not api_key:
-                raise AgentBayError(
-                    "ANTHROPIC_API_KEY environment variable is required, "
-                    "or pass api_key= to chat()."
-                )
+        """Call the LLM provider. Routes to the right backend based on provider config."""
+        config = SUPPORTED_PROVIDERS[provider]  # already validated in chat()
+        module = config["module"]
 
-            # Anthropic uses 'system' as a top-level param, not in messages
-            system_text = None
-            anthropic_messages = []
-            for msg in messages:
-                if msg.get("role") == "system":
-                    system_text = msg.get("content", "")
-                else:
-                    anthropic_messages.append(msg)
+        # --- Anthropic (native) ---
+        if module == "anthropic" and provider not in ("bedrock",):
+            return AgentBay._call_anthropic(messages, model, config, **kwargs)
 
-            client = anthropic.Anthropic(api_key=api_key)
+        # --- AWS Bedrock (Anthropic via Bedrock) ---
+        if provider == "bedrock":
+            return AgentBay._call_bedrock(messages, model, config, **kwargs)
 
-            call_kwargs: Dict[str, Any] = {
-                "model": model,
-                "messages": anthropic_messages,
-            }
-            if system_text:
-                call_kwargs["system"] = system_text
-            if "max_tokens" not in kwargs:
-                kwargs["max_tokens"] = 4096
+        # --- Azure OpenAI ---
+        if provider == "azure":
+            return AgentBay._call_azure(messages, model, config, **kwargs)
 
-            call_kwargs.update(kwargs)
-            return client.messages.create(**call_kwargs)
+        # --- Google Gemini ---
+        if module == "google.generativeai":
+            return AgentBay._call_google(messages, model, config, **kwargs)
 
-        elif provider == "openai":
-            try:
-                import openai
-            except ImportError:
-                raise ImportError(
-                    "The 'openai' package is required for provider='openai'. "
-                    "Install it with: pip install openai"
-                )
-            api_key = kwargs.pop("api_key", None) or os.environ.get("OPENAI_API_KEY")
-            if not api_key:
-                raise AgentBayError(
-                    "OPENAI_API_KEY environment variable is required, "
-                    "or pass api_key= to chat()."
-                )
+        # --- Cohere ---
+        if module == "cohere":
+            return AgentBay._call_cohere(messages, model, config, **kwargs)
 
-            client = openai.OpenAI(api_key=api_key)
-            call_kwargs = {
-                "model": model,
-                "messages": messages,
-            }
-            call_kwargs.update(kwargs)
-            return client.chat.completions.create(**call_kwargs)
+        # --- OpenAI-compatible (OpenAI, xAI, Mistral, DeepSeek, Together,
+        #     Fireworks, Groq, Perplexity, Ollama, LM Studio, llama.cpp) ---
+        return AgentBay._call_openai_compatible(messages, model, config, **kwargs)
 
-        else:
-            raise AgentBayError(
-                f"Unknown provider '{provider}'. Supported: 'anthropic', 'openai'."
+    @staticmethod
+    def _call_anthropic(messages: list[dict], model: str, config: dict, **kwargs: Any) -> Any:
+        """Call the Anthropic API natively."""
+        try:
+            import anthropic
+        except ImportError:
+            raise ImportError(
+                "The 'anthropic' package is required for provider='anthropic'. "
+                "Install it with: pip install anthropic"
             )
+        api_key = AgentBay._get_provider_key(config, **kwargs)
+        kwargs.pop("api_key", None)
+
+        # Anthropic uses 'system' as a top-level param, not in messages
+        system_text = None
+        anthropic_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_text = msg.get("content", "")
+            else:
+                anthropic_messages.append(msg)
+
+        client = anthropic.Anthropic(api_key=api_key)
+
+        call_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": anthropic_messages,
+        }
+        if system_text:
+            call_kwargs["system"] = system_text
+        if "max_tokens" not in kwargs:
+            kwargs["max_tokens"] = 4096
+
+        call_kwargs.update(kwargs)
+        return client.messages.create(**call_kwargs)
+
+    @staticmethod
+    def _call_bedrock(messages: list[dict], model: str, config: dict, **kwargs: Any) -> Any:
+        """Call Anthropic models via AWS Bedrock."""
+        try:
+            import anthropic
+        except ImportError:
+            raise ImportError(
+                "The 'anthropic' package is required for provider='bedrock'. "
+                "Install it with: pip install anthropic"
+            )
+
+        kwargs.pop("api_key", None)
+
+        # Anthropic uses 'system' as a top-level param, not in messages
+        system_text = None
+        anthropic_messages = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_text = msg.get("content", "")
+            else:
+                anthropic_messages.append(msg)
+
+        # Bedrock client uses AWS credentials from env/boto3
+        client = anthropic.AnthropicBedrock(
+            aws_region=os.environ.get("AWS_REGION", "us-east-1"),
+        )
+
+        call_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": anthropic_messages,
+        }
+        if system_text:
+            call_kwargs["system"] = system_text
+        if "max_tokens" not in kwargs:
+            kwargs["max_tokens"] = 4096
+
+        call_kwargs.update(kwargs)
+        return client.messages.create(**call_kwargs)
+
+    @staticmethod
+    def _call_azure(messages: list[dict], model: str, config: dict, **kwargs: Any) -> Any:
+        """Call Azure OpenAI."""
+        try:
+            import openai
+        except ImportError:
+            raise ImportError(
+                "The 'openai' package is required for provider='azure'. "
+                "Install it with: pip install openai"
+            )
+
+        api_key = AgentBay._get_provider_key(config, **kwargs)
+        kwargs.pop("api_key", None)
+        endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-06-01")
+        if not endpoint:
+            raise AgentBayError(
+                "AZURE_OPENAI_ENDPOINT env var is required for provider='azure'."
+            )
+
+        client = openai.AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=endpoint,
+            api_version=api_version,
+        )
+        call_kwargs: Dict[str, Any] = {"model": model, "messages": messages}
+        call_kwargs.update(kwargs)
+        return client.chat.completions.create(**call_kwargs)
+
+    @staticmethod
+    def _call_openai_compatible(messages: list[dict], model: str, config: dict, **kwargs: Any) -> Any:
+        """Call any OpenAI-compatible API (OpenAI, xAI, Mistral, DeepSeek,
+        Together, Fireworks, Groq, Perplexity, Ollama, LM Studio, llama.cpp).
+        """
+        try:
+            import openai
+        except ImportError:
+            raise ImportError(
+                "The 'openai' package is required for this provider. "
+                "Install it with: pip install openai"
+            )
+
+        api_key = AgentBay._get_provider_key(config, **kwargs)
+        kwargs.pop("api_key", None)
+        base_url = config.get("base_url")
+
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        call_kwargs: Dict[str, Any] = {"model": model, "messages": messages}
+        call_kwargs.update(kwargs)
+        return client.chat.completions.create(**call_kwargs)
+
+    @staticmethod
+    def _call_google(messages: list[dict], model: str, config: dict, **kwargs: Any) -> Any:
+        """Call Google Gemini via the google-generativeai SDK."""
+        try:
+            import google.generativeai as genai
+        except ImportError:
+            raise ImportError(
+                "The 'google-generativeai' package is required for provider='google'. "
+                "Install it with: pip install google-generativeai"
+            )
+
+        api_key = AgentBay._get_provider_key(config, **kwargs)
+        kwargs.pop("api_key", None)
+        genai.configure(api_key=api_key)
+
+        # Convert OpenAI-format messages to Gemini format
+        system_text = None
+        gemini_history = []
+        last_content = ""
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                system_text = content
+            elif role == "assistant":
+                gemini_history.append({"role": "model", "parts": [content]})
+            elif role == "user":
+                last_content = content
+                # Don't add the last user message to history -- it goes in generate_content
+                gemini_history.append({"role": "user", "parts": [content]})
+
+        # Pop the last user message from history (it's the prompt to generate_content)
+        if gemini_history and gemini_history[-1]["role"] == "user":
+            last_msg = gemini_history.pop()
+            last_content = last_msg["parts"][0]
+
+        gen_config = {}
+        if "temperature" in kwargs:
+            gen_config["temperature"] = kwargs.pop("temperature")
+        if "max_tokens" in kwargs:
+            gen_config["max_output_tokens"] = kwargs.pop("max_tokens")
+
+        gm = genai.GenerativeModel(
+            model_name=model,
+            system_instruction=system_text,
+            generation_config=gen_config or None,
+        )
+
+        chat = gm.start_chat(history=gemini_history) if gemini_history else gm.start_chat()
+        return chat.send_message(last_content)
+
+    @staticmethod
+    def _call_cohere(messages: list[dict], model: str, config: dict, **kwargs: Any) -> Any:
+        """Call Cohere's chat API."""
+        try:
+            import cohere
+        except ImportError:
+            raise ImportError(
+                "The 'cohere' package is required for provider='cohere'. "
+                "Install it with: pip install cohere"
+            )
+
+        api_key = AgentBay._get_provider_key(config, **kwargs)
+        kwargs.pop("api_key", None)
+
+        client = cohere.ClientV2(api_key=api_key)
+
+        # Cohere v2 chat accepts OpenAI-format messages directly
+        call_kwargs: Dict[str, Any] = {"model": model, "messages": messages}
+        if "max_tokens" in kwargs:
+            call_kwargs["max_tokens"] = kwargs.pop("max_tokens")
+        if "temperature" in kwargs:
+            call_kwargs["temperature"] = kwargs.pop("temperature")
+
+        call_kwargs.update(kwargs)
+        return client.chat(**call_kwargs)
 
     @staticmethod
     def _extract_response_text(response: Any, provider: str) -> str | None:
         """Extract the text content from an LLM response."""
+        config = SUPPORTED_PROVIDERS.get(provider, {})
+        module = config.get("module", "")
         try:
-            if provider == "anthropic":
+            if module == "anthropic" or provider in ("anthropic", "bedrock"):
                 # Anthropic Message object
                 for block in response.content:
                     if hasattr(block, "text"):
                         return block.text
                 return None
-            elif provider == "openai":
-                # OpenAI ChatCompletion
+            elif module == "google.generativeai":
+                # Google Gemini response
+                return response.text
+            elif module == "cohere":
+                # Cohere v2 ChatResponse
+                if hasattr(response, "message") and hasattr(response.message, "content"):
+                    parts = response.message.content
+                    if parts and hasattr(parts[0], "text"):
+                        return parts[0].text
+                return None
+            else:
+                # OpenAI-compatible (OpenAI, xAI, Groq, DeepSeek, Together, etc.)
                 return response.choices[0].message.content
         except (AttributeError, IndexError, TypeError):
             return None

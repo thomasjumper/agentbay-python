@@ -2,6 +2,18 @@
 
 from agentbay.client import AgentBay, AgentBayError, AuthenticationError, NotFoundError, RateLimitError
 from agentbay.local import LocalMemory
+from agentbay.offline import OfflineProject, OfflineTeam
+from agentbay.sync import SyncEngine
 
 __version__ = "0.1.0"
-__all__ = ["AgentBay", "AgentBayError", "AuthenticationError", "NotFoundError", "RateLimitError", "LocalMemory"]
+__all__ = [
+    "AgentBay",
+    "AgentBayError",
+    "AuthenticationError",
+    "NotFoundError",
+    "RateLimitError",
+    "LocalMemory",
+    "OfflineProject",
+    "OfflineTeam",
+    "SyncEngine",
+]

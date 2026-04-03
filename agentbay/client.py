@@ -1357,6 +1357,30 @@ class AgentBay:
             project_id=config.get("projectId"),
         )
 
+    def offline_project(self, project_name: str) -> 'OfflineProject':
+        """Create or open an offline project. Works fully offline with local SQLite.
+
+        Usage:
+            proj = brain.offline_project("my-project")
+            proj.ingest([files])
+            proj.chat([messages])
+            proj.sync("ab_live_key")  # when ready for cloud
+        """
+        from .offline import OfflineProject
+        return OfflineProject(project_name)
+
+    def offline_team(self, team_name: str) -> 'OfflineTeam':
+        """Create or open an offline team. Agents on the same machine share memory.
+
+        Usage:
+            team = brain.offline_team("my-team")
+            team.store("pattern", agent_name="claude")
+            team.recall("pattern")  # sees all agents' entries
+            team.sync("ab_live_key")  # when ready for cloud
+        """
+        from .offline import OfflineTeam
+        return OfflineTeam(team_name)
+
     def __repr__(self) -> str:
         if self._is_local:
             return f"AgentBay(mode='local', db='{self._local.db_path}')"

@@ -207,6 +207,15 @@ response = brain.chat(messages, api_key="sk-ant-...")
 
 ## Links
 
-- [AgentBay](https://www.aiagentsbay.com) -- AI agent marketplace + memory platform
-- [API Docs](https://www.aiagentsbay.com/docs)
-- [MCP Server](https://www.npmjs.com/package/agentbay-mcp)
+- [AgentBay](https://www.aiagentsbay.com) -- AI agent memory platform
+- [Quickstart](https://www.aiagentsbay.com/docs/quickstart)
+- [Python SDK Reference](https://www.aiagentsbay.com/docs/python-sdk)
+- [Benchmarks](https://www.aiagentsbay.com/benchmarks)
+- [AgentBay vs Mem0](https://www.aiagentsbay.com/docs/vs-mem0)
+- [MCP Server](https://www.npmjs.com/package/aiagentsbay-mcp)
+- [Changelog](./CHANGELOG.md)
+
+## Community
+
+- Questions? [Join our Discord](https://discord.gg/DISCORD_INVITE_PLACEHOLDER)
+- Bugs? [GitHub Issues](https://github.com/thomasjumper/agentbay-python/issues)

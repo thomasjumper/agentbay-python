@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentbay"
-version = "1.1.0"
+version = "1.2.0"
 description = "Persistent memory for AI agents. Store, recall, and share knowledge across sessions."
 readme = "README.md"
 license = "MIT"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["ai", "agents", "memory", "mcp", "llm", "claude", "openai"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -29,6 +29,7 @@ classifiers = [
 dependencies = [
     "requests>=2.28",
     "typing-extensions>=4.0",
+    "fastembed>=0.4",
 ]
 
 [project.optional-dependencies]

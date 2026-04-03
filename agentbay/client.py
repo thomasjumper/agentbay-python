@@ -12,7 +12,39 @@ from typing import Any, Dict, List, Optional
 import requests
 from typing_extensions import TypeAlias
 
+import time
+
 MemoryEntry: TypeAlias = Dict[str, Any]
+
+__version__ = "1.2.0"
+
+
+def _check_for_updates_background() -> None:
+    """Check PyPI for newer version in a background thread. Non-blocking, once per day."""
+    def _check() -> None:
+        try:
+            config_dir = Path.home() / ".agentbay"
+            check_file = config_dir / ".last_update_check"
+
+            if check_file.exists():
+                last_check = float(check_file.read_text().strip())
+                if time.time() - last_check < 86400:
+                    return
+
+            import urllib.request
+            resp = urllib.request.urlopen("https://pypi.org/pypi/agentbay/json", timeout=3)
+            data = json.loads(resp.read())
+            latest = data["info"]["version"]
+
+            if latest != __version__:
+                print(f"\U0001f9e0 AgentBay {latest} available (you have {__version__}). Run: pip install --upgrade agentbay")
+
+            config_dir.mkdir(exist_ok=True)
+            check_file.write_text(str(time.time()))
+        except Exception:
+            pass
+
+    threading.Thread(target=_check, daemon=True).start()
 
 # Patterns that suggest something worth storing
 _LEARNING_PATTERNS = re.compile(
@@ -113,22 +145,32 @@ def _extract_title(text: str, max_len: int = 100) -> str:
 class AgentBayError(Exception):
     """Base exception for AgentBay SDK errors."""
 
-    def __init__(self, message: str, status_code: int | None = None, response: dict | None = None):
+    def __init__(self, message: str, status_code: int | None = None, response: dict | None = None, help_url: str | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.response = response
+        self.help_url = help_url
 
 
 class AuthenticationError(AgentBayError):
     """Raised when the API key is invalid or missing."""
 
+    def __init__(self, message: str = "Invalid or expired API key", **kwargs: Any):
+        super().__init__(message, help_url="https://www.aiagentsbay.com/dashboard/api-keys", **kwargs)
+
 
 class NotFoundError(AgentBayError):
     """Raised when a resource is not found."""
 
+    def __init__(self, message: str = "Resource not found", **kwargs: Any):
+        super().__init__(message, help_url="https://www.aiagentsbay.com/dashboard", **kwargs)
+
 
 class RateLimitError(AgentBayError):
     """Raised when the API rate limit is exceeded."""
+
+    def __init__(self, message: str = "Rate limit exceeded", **kwargs: Any):
+        super().__init__(message, help_url="https://www.aiagentsbay.com/pricing", **kwargs)
 
 
 class AgentBay:
@@ -164,6 +206,10 @@ class AgentBay:
         project_id: str | None = None,
         timeout: int = 30,
     ) -> None:
+        # Check environment variable before falling back to local mode
+        if not api_key:
+            api_key = os.environ.get("AGENTBAY_API_KEY")
+
         if not api_key:
             # Local mode -- no cloud, SQLite only
             from .local import LocalMemory
@@ -175,6 +221,8 @@ class AgentBay:
             self.base_url = base_url
             self.timeout = timeout
             self._session = None
+            self._show_welcome("local")
+            _check_for_updates_background()
             return
 
         self._local = None
@@ -189,9 +237,28 @@ class AgentBay:
             {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
-                "User-Agent": "agentbay-python/0.1.0",
+                "User-Agent": "agentbay-python/1.2.0",
             }
         )
+        self._show_welcome("cloud")
+        _check_for_updates_background()
+
+    @staticmethod
+    def _show_welcome(mode: str) -> None:
+        """Show a one-time welcome message on first use."""
+        config_dir = Path.home() / ".agentbay"
+        welcome_flag = config_dir / ".welcomed"
+        if welcome_flag.exists():
+            return
+        try:
+            config_dir.mkdir(exist_ok=True)
+            welcome_flag.touch()
+            print(f"\U0001f9e0 AgentBay ready ({mode} mode)")
+            print(f"   Try: brain.store('your first pattern', title='test')")
+            print(f"   Then: brain.recall('pattern')")
+            print(f"   Docs: https://www.aiagentsbay.com/docs/quickstart")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # chat() -- The auto-memory LLM wrapper
@@ -1117,18 +1184,30 @@ class AgentBay:
     def _handle_response(self, resp: requests.Response) -> Any:
         if resp.status_code == 401:
             raise AuthenticationError(
-                "Invalid API key. Check your key at https://www.aiagentsbay.com/dashboard",
+                "Invalid or expired API key. Get a new one at https://www.aiagentsbay.com/dashboard/api-keys",
                 status_code=401,
+            )
+        if resp.status_code == 403:
+            raise AgentBayError(
+                "Your plan doesn't include this feature. See plans at https://www.aiagentsbay.com/pricing",
+                status_code=403,
+                help_url="https://www.aiagentsbay.com/pricing",
             )
         if resp.status_code == 404:
             raise NotFoundError(
-                f"Resource not found: {resp.url}",
+                "Project or memory entry not found. Check your project_id at https://www.aiagentsbay.com/dashboard",
                 status_code=404,
             )
         if resp.status_code == 429:
             raise RateLimitError(
-                "Rate limit exceeded. Please slow down or upgrade your plan.",
+                "Rate limit exceeded. Upgrade your plan at https://www.aiagentsbay.com/pricing",
                 status_code=429,
+            )
+        if resp.status_code >= 500:
+            raise AgentBayError(
+                f"AgentBay server error ({resp.status_code}). Check status at https://www.aiagentsbay.com/status",
+                status_code=resp.status_code,
+                help_url="https://www.aiagentsbay.com/status",
             )
         if resp.status_code >= 400:
             try:
@@ -1136,7 +1215,7 @@ class AgentBay:
             except ValueError:
                 detail = {"text": resp.text}
             raise AgentBayError(
-                f"API error {resp.status_code}: {detail}",
+                f"API error {resp.status_code}: {detail.get('error', detail)}",
                 status_code=resp.status_code,
                 response=detail,
             )
@@ -1257,24 +1336,36 @@ class AgentBay:
         base = self.base_url if hasattr(self, 'base_url') and self.base_url else "https://www.aiagentsbay.com"
         url = f"{base}/register?utm_source=sdk&utm_medium=login"
 
-        print("\n🧠 AgentBay Login")
+        print("\n\U0001f9e0 AgentBay Login")
         print("=" * 40)
-        print(f"Opening {base}/register in your browser...")
-        print()
 
+        # Try opening browser (may fail in headless/Docker/SSH environments)
+        browser_opened = False
         try:
-            webbrowser.open(url)
+            browser_opened = webbrowser.open(url)
         except Exception:
-            print(f"Could not open browser. Go to: {url}")
+            pass
 
-        print("Steps:")
-        print("  1. Sign up or log in")
-        print("  2. Go to Dashboard → API Keys")
-        print("  3. Create a new key")
-        print("  4. Copy the key (starts with ab_live_)")
+        if browser_opened:
+            print(f"Browser opened. Sign up or log in at {url}")
+        else:
+            print("Open this URL in your browser:")
+            print(f"  {url}")
         print()
 
-        api_key = input("Paste your API key here: ").strip()
+        # Check environment variable as alternative to interactive input
+        env_key = os.environ.get("AGENTBAY_API_KEY")
+        if env_key:
+            print(f"Found AGENTBAY_API_KEY in environment. Using that instead.")
+            api_key = env_key
+        else:
+            print("Steps:")
+            print("  1. Sign up or log in")
+            print("  2. Go to Dashboard \u2192 API Keys")
+            print("  3. Create a new key")
+            print("  4. Copy the key (starts with ab_live_)")
+            print()
+            api_key = input("Paste your API key here: ").strip()
 
         if not api_key or not api_key.startswith("ab_live_"):
             raise AgentBayError("Invalid API key. Must start with 'ab_live_'")

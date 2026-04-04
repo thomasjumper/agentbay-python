@@ -631,6 +631,42 @@ class AgentBay:
         pid = self._resolve_project(project_id)
         self._patch(f"/api/v1/projects/{pid}/memory", {"knowledgeId": knowledge_id, "action": "verify"})
 
+    def import_conversation(
+        self,
+        messages: list[dict],
+        user_id: str | None = None,
+        source: str = "conversation-import",
+        project_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """Import a past conversation and auto-extract memories.
+
+        Feed in a conversation from ChatGPT, Claude, or any LLM and
+        AgentBay will extract key facts, preferences, and patterns
+        as searchable memories.
+
+        Args:
+            messages: Chat messages in OpenAI format
+                [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+            user_id: Optional user ID to scope the memories to.
+            source: Label for where the conversation came from (default: "conversation-import").
+            project_id: Project to import into (overrides default).
+
+        Returns:
+            Dict with imported count, extracted count, skipped count, and memories list.
+
+        Example::
+
+            brain.import_conversation([
+                {"role": "user", "content": "I prefer dark mode and use Python 3.12"},
+                {"role": "assistant", "content": "Got it! Dark mode is enabled. Python 3.12 has great performance."},
+            ])
+        """
+        pid = self._resolve_project(project_id)
+        body: Dict[str, Any] = {"messages": messages, "source": source}
+        if user_id:
+            body["user_id"] = user_id
+        return self._post(f"/api/v1/projects/{pid}/memory/import", body)
+
     def health(
         self,
         project_id: str | None = None,
@@ -784,9 +820,8 @@ class AgentBay:
             pass
 
         raise AgentBayError(
-            "No LLM provider detected. Set an API key env var "
-            "(ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, etc.) "
-            "or run a local LLM server (Ollama, LM Studio, llama.cpp)."
+            "No LLM API key found. Set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, "
+            "GOOGLE_API_KEY, or pass provider='ollama' for local models."
         )
 
     @staticmethod
@@ -1191,7 +1226,7 @@ class AgentBay:
     def _handle_response(self, resp: requests.Response) -> Any:
         if resp.status_code == 401:
             raise AuthenticationError(
-                "Invalid or expired API key. Get a new one at https://www.aiagentsbay.com/dashboard/api-keys",
+                "Invalid API key. Get a key at https://www.aiagentsbay.com/dashboard/api-keys",
                 status_code=401,
             )
         if resp.status_code == 403:
@@ -1206,13 +1241,33 @@ class AgentBay:
                 status_code=404,
             )
         if resp.status_code == 429:
+            # Parse the response body for monthly limit details
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            if body.get("limit") and body.get("used"):
+                tier = body.get("tier", "Free")
+                used = body.get("used")
+                limit = body.get("limit")
+                raise RateLimitError(
+                    f"Monthly API call limit reached ({limit:,}/month on {tier} tier). "
+                    f"Used: {used:,}/{limit:,}. "
+                    f"Upgrade at https://www.aiagentsbay.com/pricing",
+                    status_code=429,
+                    response=body,
+                )
             raise RateLimitError(
-                "Rate limit exceeded. Upgrade your plan at https://www.aiagentsbay.com/pricing",
+                "Rate limit reached. Free tier: 100 recalls/hr, 200 stores/hr. "
+                "Upgrade at https://www.aiagentsbay.com/pricing",
                 status_code=429,
+                response=body if body else None,
             )
         if resp.status_code >= 500:
             raise AgentBayError(
-                f"AgentBay server error ({resp.status_code}). Check status at https://www.aiagentsbay.com/status",
+                f"AgentBay server error ({resp.status_code}). "
+                f"This is a problem on our end, not yours. "
+                f"Check status at https://www.aiagentsbay.com/status",
                 status_code=resp.status_code,
                 help_url="https://www.aiagentsbay.com/status",
             )

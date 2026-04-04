@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentbay"
-version = "1.2.0"
+version = "1.2.1"
 description = "Persistent memory for AI agents. Store, recall, and share knowledge across sessions."
 readme = "README.md"
 license = "MIT"

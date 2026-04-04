@@ -1135,6 +1135,13 @@ class AgentBay:
     def _resolve_project(self, project_id: str | None) -> str:
         pid = project_id or self.project_id
         if not pid:
+            # Auto-setup: create a brain on first use so users never hit this error
+            try:
+                result = self.setup_brain("My Brain")
+                pid = result.get("projectId") or result.get("project", {}).get("id")
+            except Exception:
+                pass
+        if not pid:
             raise AgentBayError(
                 "No project_id provided. Either pass project_id to this method, "
                 "set it in the constructor, or call setup_brain() first."

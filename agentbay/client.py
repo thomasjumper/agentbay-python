@@ -16,7 +16,7 @@ import time
 
 MemoryEntry: TypeAlias = Dict[str, Any]
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
 def _check_for_updates_background() -> None:

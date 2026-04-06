@@ -5,7 +5,7 @@ from agentbay.local import LocalMemory
 from agentbay.offline import OfflineProject, OfflineTeam
 from agentbay.sync import SyncEngine
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __all__ = [
     "AgentBay",
     "AgentBayError",

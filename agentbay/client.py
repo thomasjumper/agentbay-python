@@ -173,6 +173,16 @@ class RateLimitError(AgentBayError):
         super().__init__(message, help_url="https://www.aiagentsbay.com/pricing", **kwargs)
 
 
+def _mark_onboarded() -> None:
+    """Mark onboarding as complete so it doesn't run again."""
+    try:
+        config_dir = Path.home() / ".agentbay"
+        config_dir.mkdir(exist_ok=True)
+        (config_dir / ".onboarded").touch()
+    except Exception:
+        pass
+
+
 class AgentBay:
     """Persistent memory for AI agents.
 
@@ -206,12 +216,20 @@ class AgentBay:
         project_id: str | None = None,
         timeout: int = 30,
     ) -> None:
-        # Check environment variable before falling back to local mode
+        # Check environment variable
         if not api_key:
             api_key = os.environ.get("AGENTBAY_API_KEY")
 
+        # Check saved config
         if not api_key:
-            # Local mode -- no cloud, SQLite only
+            api_key = self._load_saved_key()
+
+        # No key found — interactive onboarding (only in terminals, only once)
+        if not api_key:
+            api_key = self._interactive_onboarding(base_url)
+
+        if not api_key:
+            # Local mode — user chose local or non-interactive environment
             from .local import LocalMemory
 
             self._local = LocalMemory()
@@ -253,12 +271,144 @@ class AgentBay:
         try:
             config_dir.mkdir(exist_ok=True)
             welcome_flag.touch()
-            print(f"\U0001f9e0 AgentBay ready ({mode} mode)")
-            print(f"   Try: brain.store('your first pattern', title='test')")
-            print(f"   Then: brain.recall('pattern')")
-            print(f"   Docs: https://www.aiagentsbay.com/docs/quickstart")
+            if mode == "local":
+                print(f"\U0001f9e0 AgentBay ready (local mode — unlimited, offline)")
+                print(f"   Memories stored at: ~/.agentbay/")
+                print(f"   Ready for cloud? Run: brain.login()")
+            else:
+                print(f"\U0001f9e0 AgentBay ready (cloud mode)")
+                print(f"   Memories sync across devices, teams, and agents")
+            print(f"   Try: brain.chat([{{'role': 'user', 'content': 'hello'}}])")
+            print(f"   Docs: https://www.aiagentsbay.com/getting-started")
         except Exception:
             pass
+
+    @staticmethod
+    def _load_saved_key() -> str | None:
+        """Load API key from saved config file."""
+        try:
+            config_file = Path.home() / ".agentbay" / "config.json"
+            if config_file.exists():
+                data = json.loads(config_file.read_text())
+                return data.get("api_key") or data.get("apiKey")
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _save_key(api_key: str) -> None:
+        """Save API key to config for future sessions."""
+        try:
+            config_dir = Path.home() / ".agentbay"
+            config_dir.mkdir(exist_ok=True)
+            config_file = config_dir / "config.json"
+            data = {}
+            if config_file.exists():
+                try:
+                    data = json.loads(config_file.read_text())
+                except Exception:
+                    pass
+            data["api_key"] = api_key
+            config_file.write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _interactive_onboarding(base_url: str) -> str | None:
+        """Interactive first-run onboarding. Only runs in terminals.
+
+        Flow:
+        1. Ask for API key (paste or skip)
+        2. If skipped: Login / Create Account / Use Local
+        3. Login/Create opens browser, then asks for key paste
+        4. Key is saved for future sessions
+
+        Returns the API key or None for local mode.
+        """
+        # Don't prompt if not a terminal (CI, imports, scripts)
+        if not os.isatty(0) or os.environ.get("AGENTBAY_QUIET"):
+            return None
+
+        # Check if onboarding was already completed
+        onboard_flag = Path.home() / ".agentbay" / ".onboarded"
+        if onboard_flag.exists():
+            return None
+
+        print("\n\U0001f9e0 AgentBay Setup")
+        print("=" * 40)
+        print()
+
+        # Step 1: Ask for API key
+        try:
+            key = input("Enter your API key (or press Enter to skip): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+        if key and key.startswith("ab_live_"):
+            AgentBay._save_key(key)
+            _mark_onboarded()
+            return key
+
+        if key and not key.startswith("ab_live_"):
+            print("  Invalid key format. Keys start with ab_live_")
+            print()
+
+        # Step 2: Options
+        print("\nOptions:")
+        print("  [1] Log in to existing account")
+        print("  [2] Create a new account")
+        print("  [3] Use local mode (offline, no account needed)")
+        print()
+
+        try:
+            choice = input("Choose [1/2/3]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            _mark_onboarded()
+            return None
+
+        if choice in ("1", "2"):
+            # Open browser
+            path = "/login" if choice == "1" else "/register"
+            url = f"{base_url}{path}?utm_source=sdk&utm_medium=onboarding"
+
+            browser_opened = False
+            try:
+                import webbrowser
+                browser_opened = webbrowser.open(url)
+            except Exception:
+                pass
+
+            if browser_opened:
+                print(f"\n  Browser opened: {url}")
+            else:
+                print(f"\n  Open this URL in your browser:")
+                print(f"  {url}")
+
+            print()
+            print("  After signing in, go to Dashboard → API Keys")
+            print("  Create a key and paste it below.")
+            print()
+
+            try:
+                key = input("Paste your API key: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                _mark_onboarded()
+                return None
+
+            if key and key.startswith("ab_live_"):
+                AgentBay._save_key(key)
+                _mark_onboarded()
+                print(f"\n  \u2713 Connected to AgentBay cloud!")
+                return key
+            else:
+                print("  No valid key entered. Starting in local mode.")
+                _mark_onboarded()
+                return None
+
+        # Choice 3 or anything else → local mode
+        _mark_onboarded()
+        return None
+
 
     # ------------------------------------------------------------------
     # chat() -- The auto-memory LLM wrapper
@@ -631,42 +781,6 @@ class AgentBay:
         pid = self._resolve_project(project_id)
         self._patch(f"/api/v1/projects/{pid}/memory", {"knowledgeId": knowledge_id, "action": "verify"})
 
-    def import_conversation(
-        self,
-        messages: list[dict],
-        user_id: str | None = None,
-        source: str = "conversation-import",
-        project_id: str | None = None,
-    ) -> Dict[str, Any]:
-        """Import a past conversation and auto-extract memories.
-
-        Feed in a conversation from ChatGPT, Claude, or any LLM and
-        AgentBay will extract key facts, preferences, and patterns
-        as searchable memories.
-
-        Args:
-            messages: Chat messages in OpenAI format
-                [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
-            user_id: Optional user ID to scope the memories to.
-            source: Label for where the conversation came from (default: "conversation-import").
-            project_id: Project to import into (overrides default).
-
-        Returns:
-            Dict with imported count, extracted count, skipped count, and memories list.
-
-        Example::
-
-            brain.import_conversation([
-                {"role": "user", "content": "I prefer dark mode and use Python 3.12"},
-                {"role": "assistant", "content": "Got it! Dark mode is enabled. Python 3.12 has great performance."},
-            ])
-        """
-        pid = self._resolve_project(project_id)
-        body: Dict[str, Any] = {"messages": messages, "source": source}
-        if user_id:
-            body["user_id"] = user_id
-        return self._post(f"/api/v1/projects/{pid}/memory/import", body)
-
     def health(
         self,
         project_id: str | None = None,
@@ -820,8 +934,9 @@ class AgentBay:
             pass
 
         raise AgentBayError(
-            "No LLM API key found. Set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, "
-            "GOOGLE_API_KEY, or pass provider='ollama' for local models."
+            "No LLM provider detected. Set an API key env var "
+            "(ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, etc.) "
+            "or run a local LLM server (Ollama, LM Studio, llama.cpp)."
         )
 
     @staticmethod
@@ -1170,7 +1285,7 @@ class AgentBay:
     def _resolve_project(self, project_id: str | None) -> str:
         pid = project_id or self.project_id
         if not pid:
-            # Auto-setup: create a brain on first use so users never hit this error
+            # Auto-setup: create a brain on first use so users don't have to
             try:
                 result = self.setup_brain("My Brain")
                 pid = result.get("projectId") or result.get("project", {}).get("id")
@@ -1226,7 +1341,7 @@ class AgentBay:
     def _handle_response(self, resp: requests.Response) -> Any:
         if resp.status_code == 401:
             raise AuthenticationError(
-                "Invalid API key. Get a key at https://www.aiagentsbay.com/dashboard/api-keys",
+                "Invalid or expired API key. Get a new one at https://www.aiagentsbay.com/dashboard/api-keys",
                 status_code=401,
             )
         if resp.status_code == 403:
@@ -1241,33 +1356,13 @@ class AgentBay:
                 status_code=404,
             )
         if resp.status_code == 429:
-            # Parse the response body for monthly limit details
-            try:
-                body = resp.json()
-            except ValueError:
-                body = {}
-            if body.get("limit") and body.get("used"):
-                tier = body.get("tier", "Free")
-                used = body.get("used")
-                limit = body.get("limit")
-                raise RateLimitError(
-                    f"Monthly API call limit reached ({limit:,}/month on {tier} tier). "
-                    f"Used: {used:,}/{limit:,}. "
-                    f"Upgrade at https://www.aiagentsbay.com/pricing",
-                    status_code=429,
-                    response=body,
-                )
             raise RateLimitError(
-                "Rate limit reached. Free tier: 100 recalls/hr, 200 stores/hr. "
-                "Upgrade at https://www.aiagentsbay.com/pricing",
+                "Rate limit exceeded. Upgrade your plan at https://www.aiagentsbay.com/pricing",
                 status_code=429,
-                response=body if body else None,
             )
         if resp.status_code >= 500:
             raise AgentBayError(
-                f"AgentBay server error ({resp.status_code}). "
-                f"This is a problem on our end, not yours. "
-                f"Check status at https://www.aiagentsbay.com/status",
+                f"AgentBay server error ({resp.status_code}). Check status at https://www.aiagentsbay.com/status",
                 status_code=resp.status_code,
                 help_url="https://www.aiagentsbay.com/status",
             )

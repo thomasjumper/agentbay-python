@@ -19,12 +19,25 @@ from .local import LocalMemory
 DB_PATH = os.environ.get("AGENTBAY_DB_PATH", None)
 HOST = os.environ.get("AGENTBAY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("AGENTBAY_PORT", "8787"))
+# API key auth: set AGENTBAY_SERVER_KEY to require Bearer token auth
+# If not set, server runs without auth (local development only)
+SERVER_KEY = os.environ.get("AGENTBAY_SERVER_KEY", "")
 
 memory = LocalMemory(db_path=DB_PATH)
 
 
 class AgentBayHandler(BaseHTTPRequestHandler):
     """Minimal REST API matching the cloud endpoints."""
+
+    def _check_auth(self) -> bool:
+        """Check Bearer token if AGENTBAY_SERVER_KEY is set."""
+        if not SERVER_KEY:
+            return True  # No auth configured
+        auth = self.headers.get("Authorization", "")
+        if auth == f"Bearer {SERVER_KEY}":
+            return True
+        self._json_response({"error": "Unauthorized. Set Authorization: Bearer <AGENTBAY_SERVER_KEY>"}, 401)
+        return False
 
     def _json_response(self, data: dict, status: int = 200):
         self.send_response(status)
@@ -45,6 +58,9 @@ class AgentBayHandler(BaseHTTPRequestHandler):
         self._json_response({})
 
     def do_GET(self):
+        if not self._check_auth():
+            return
+
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
 
@@ -94,6 +110,9 @@ class AgentBayHandler(BaseHTTPRequestHandler):
         ]}, 404)
 
     def do_POST(self):
+        if not self._check_auth():
+            return
+
         parsed = urlparse(self.path)
         body = self._read_body()
 
@@ -138,6 +157,9 @@ class AgentBayHandler(BaseHTTPRequestHandler):
         self._json_response({"error": "Not found"}, 404)
 
     def do_DELETE(self):
+        if not self._check_auth():
+            return
+
         parsed = urlparse(self.path)
         body = self._read_body()
 
